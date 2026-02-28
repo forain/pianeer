@@ -1,0 +1,303 @@
+/// SFZ parser for the Salamander Grand Piano instrument.
+///
+/// Handles the opcodes actually present in the file:
+///   sample, lokey, hikey, lovel, hivel, pitch_keycenter,
+///   amp_veltrack, ampeg_release, volume, trigger, rt_decay,
+///   lorand, hirand, on_locc64, on_hicc64, group, off_by, pitch_keytrack
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Trigger {
+    Attack,
+    Release,
+}
+
+impl Default for Trigger {
+    fn default() -> Self {
+        Trigger::Attack
+    }
+}
+
+/// One parsed SFZ region with all relevant opcode values resolved
+/// (group defaults merged with region overrides).
+#[derive(Debug, Clone)]
+pub struct Region {
+    /// Absolute path to the sample file
+    pub sample: PathBuf,
+    pub lokey: u8,
+    pub hikey: u8,
+    pub lovel: u8,
+    pub hivel: u8,
+    pub pitch_keycenter: u8,
+    /// Velocity sensitivity as a percentage (0-100+). Default 100.
+    pub amp_veltrack: f32,
+    /// Release time in seconds. Default 0.
+    pub ampeg_release: f32,
+    /// Gain in dB. Default 0.
+    pub volume: f32,
+    pub trigger: Trigger,
+    /// Release trigger decay in dB/s. Default 0.
+    pub rt_decay: f32,
+    /// Random range low (0.0-1.0). Default 0.
+    pub lorand: f32,
+    /// Random range high (0.0-1.0). Default 1.
+    pub hirand: f32,
+    /// CC64 (sustain pedal) low value for trigger. None = not a pedal region.
+    pub on_locc64: Option<u8>,
+    /// CC64 (sustain pedal) high value for trigger. None = not a pedal region.
+    pub on_hicc64: Option<u8>,
+    /// Voice group number (for exclusion). None = no group.
+    pub group: Option<u32>,
+    /// Group that mutes this voice when it starts. None = no exclusion.
+    pub off_by: Option<u32>,
+    /// Pitch tracking in cents per semitone. Default 100.
+    pub pitch_keytrack: f32,
+}
+
+impl Default for Region {
+    fn default() -> Self {
+        Region {
+            sample: PathBuf::new(),
+            lokey: 0,
+            hikey: 127,
+            lovel: 0,
+            hivel: 127,
+            pitch_keycenter: 60,
+            amp_veltrack: 100.0,
+            ampeg_release: 0.0,
+            volume: 0.0,
+            trigger: Trigger::Attack,
+            rt_decay: 0.0,
+            lorand: 0.0,
+            hirand: 1.0,
+            on_locc64: None,
+            on_hicc64: None,
+            group: None,
+            off_by: None,
+            pitch_keytrack: 100.0,
+        }
+    }
+}
+
+/// Accumulates opcode state for a <group> header.
+#[derive(Debug, Clone, Default)]
+struct GroupState {
+    amp_veltrack: Option<f32>,
+    ampeg_release: Option<f32>,
+    volume: Option<f32>,
+    trigger: Option<Trigger>,
+    rt_decay: Option<f32>,
+    on_locc64: Option<u8>,
+    on_hicc64: Option<u8>,
+    group: Option<u32>,
+    off_by: Option<u32>,
+    pitch_keytrack: Option<f32>,
+    lokey: Option<u8>,
+    hikey: Option<u8>,
+    lovel: Option<u8>,
+    hivel: Option<u8>,
+}
+
+pub fn parse_sfz(sfz_path: &Path) -> Result<Vec<Region>, String> {
+    let content = std::fs::read_to_string(sfz_path)
+        .map_err(|e| format!("Failed to read SFZ: {}", e))?;
+
+    let base_dir = sfz_path.parent().unwrap_or(Path::new("."));
+
+    let mut regions = Vec::new();
+    let mut group = GroupState::default();
+    let mut in_region = false;
+    let mut current_region = Region::default();
+
+    for line in content.lines() {
+        // Strip line comments (// style)
+        let line = if let Some(idx) = line.find("//") {
+            &line[..idx]
+        } else {
+            line
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Tokenise: split on whitespace but we need to handle <header> tokens
+        // mixed with opcode=value tokens on the same line.
+        let mut tokens: Vec<&str> = Vec::new();
+        let mut rest = line;
+        while !rest.is_empty() {
+            rest = rest.trim_start();
+            if rest.starts_with('<') {
+                // Header token
+                if let Some(end) = rest.find('>') {
+                    tokens.push(&rest[..end + 1]);
+                    rest = &rest[end + 1..];
+                } else {
+                    // Malformed, skip
+                    break;
+                }
+            } else {
+                // Find next whitespace or end
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                tokens.push(&rest[..end]);
+                rest = &rest[end..];
+            }
+        }
+
+        for token in tokens {
+            if token.starts_with('<') && token.ends_with('>') {
+                let header = &token[1..token.len() - 1];
+                match header {
+                    "group" => {
+                        // Save any in-progress region
+                        if in_region {
+                            regions.push(current_region.clone());
+                            in_region = false;
+                        }
+                        // Reset group state
+                        group = GroupState::default();
+                        current_region = Region::default();
+                    }
+                    "region" => {
+                        // Save any in-progress region
+                        if in_region {
+                            regions.push(current_region.clone());
+                        }
+                        // Start new region, inheriting group defaults
+                        current_region = region_from_group(&group);
+                        in_region = true;
+                    }
+                    _ => {
+                        // Ignore other headers (control, etc.)
+                    }
+                }
+            } else if let Some(eq_pos) = token.find('=') {
+                let key = &token[..eq_pos];
+                let val = &token[eq_pos + 1..];
+
+                // Apply opcode to current context
+                if in_region {
+                    apply_opcode_to_region(&mut current_region, key, val, base_dir);
+                } else {
+                    apply_opcode_to_group(&mut group, key, val);
+                }
+            }
+        }
+    }
+
+    // Save last region
+    if in_region {
+        regions.push(current_region);
+    }
+
+    Ok(regions)
+}
+
+fn region_from_group(g: &GroupState) -> Region {
+    let mut r = Region::default();
+    if let Some(v) = g.amp_veltrack { r.amp_veltrack = v; }
+    if let Some(v) = g.ampeg_release { r.ampeg_release = v; }
+    if let Some(v) = g.volume { r.volume = v; }
+    if let Some(ref v) = g.trigger { r.trigger = v.clone(); }
+    if let Some(v) = g.rt_decay { r.rt_decay = v; }
+    r.on_locc64 = g.on_locc64;
+    r.on_hicc64 = g.on_hicc64;
+    r.group = g.group;
+    r.off_by = g.off_by;
+    if let Some(v) = g.pitch_keytrack { r.pitch_keytrack = v; }
+    if let Some(v) = g.lokey { r.lokey = v; }
+    if let Some(v) = g.hikey { r.hikey = v; }
+    if let Some(v) = g.lovel { r.lovel = v; }
+    if let Some(v) = g.hivel { r.hivel = v; }
+    r
+}
+
+fn apply_opcode_to_group(g: &mut GroupState, key: &str, val: &str) {
+    match key {
+        "amp_veltrack" => g.amp_veltrack = val.parse().ok(),
+        "ampeg_release" => g.ampeg_release = val.parse().ok(),
+        "volume" => g.volume = val.parse().ok(),
+        "trigger" => g.trigger = parse_trigger(val),
+        "rt_decay" => g.rt_decay = val.parse().ok(),
+        "on_locc64" => g.on_locc64 = val.parse().ok(),
+        "on_hicc64" => g.on_hicc64 = val.parse().ok(),
+        "group" => g.group = val.parse().ok(),
+        "off_by" => g.off_by = val.parse().ok(),
+        "pitch_keytrack" => g.pitch_keytrack = val.parse().ok(),
+        "lokey" => g.lokey = parse_key(val),
+        "hikey" => g.hikey = parse_key(val),
+        "lovel" => g.lovel = val.parse().ok(),
+        "hivel" => g.hivel = val.parse().ok(),
+        _ => {}
+    }
+}
+
+fn apply_opcode_to_region(r: &mut Region, key: &str, val: &str, base_dir: &Path) {
+    match key {
+        "sample" => {
+            // Normalise backslash (Windows paths in SFZ files)
+            let normalized = val.replace('\\', "/");
+            r.sample = base_dir.join(&normalized);
+        }
+        "lokey" => { if let Some(v) = parse_key(val) { r.lokey = v; } }
+        "hikey" => { if let Some(v) = parse_key(val) { r.hikey = v; } }
+        "lovel" => { if let Some(v) = val.parse().ok() { r.lovel = v; } }
+        "hivel" => { if let Some(v) = val.parse().ok() { r.hivel = v; } }
+        "pitch_keycenter" => { if let Some(v) = parse_key(val) { r.pitch_keycenter = v; } }
+        "amp_veltrack" => { if let Some(v) = val.parse().ok() { r.amp_veltrack = v; } }
+        "ampeg_release" => { if let Some(v) = val.parse().ok() { r.ampeg_release = v; } }
+        "volume" => { if let Some(v) = val.parse().ok() { r.volume = v; } }
+        "trigger" => { if let Some(v) = parse_trigger(val) { r.trigger = v; } }
+        "rt_decay" => { if let Some(v) = val.parse().ok() { r.rt_decay = v; } }
+        "lorand" => { if let Some(v) = val.parse().ok() { r.lorand = v; } }
+        "hirand" => { if let Some(v) = val.parse().ok() { r.hirand = v; } }
+        "on_locc64" => r.on_locc64 = val.parse().ok(),
+        "on_hicc64" => r.on_hicc64 = val.parse().ok(),
+        "group" => r.group = val.parse().ok(),
+        "off_by" => r.off_by = val.parse().ok(),
+        "pitch_keytrack" => { if let Some(v) = val.parse().ok() { r.pitch_keytrack = v; } }
+        _ => {}
+    }
+}
+
+fn parse_trigger(val: &str) -> Option<Trigger> {
+    match val {
+        "attack" => Some(Trigger::Attack),
+        "release" => Some(Trigger::Release),
+        _ => None,
+    }
+}
+
+/// Parse a key that is either a MIDI note number (integer) or a note name
+/// like "C4", "D#1", "Bb3".
+fn parse_key(val: &str) -> Option<u8> {
+    // Try numeric first
+    if let Ok(n) = val.parse::<i32>() {
+        if n >= 0 && n <= 127 { return Some(n as u8); }
+        return None;
+    }
+    // Parse note name
+    let val = val.trim();
+    if val.is_empty() { return None; }
+    let mut chars = val.chars().peekable();
+    let note_char = chars.next()?.to_ascii_uppercase();
+    let base: i32 = match note_char {
+        'C' => 0,
+        'D' => 2,
+        'E' => 4,
+        'F' => 5,
+        'G' => 7,
+        'A' => 9,
+        'B' => 11,
+        _ => return None,
+    };
+    let accidental = match chars.peek() {
+        Some('#') => { chars.next(); 1 }
+        Some('b') => { chars.next(); -1 }
+        _ => 0,
+    };
+    let octave_str: String = chars.collect();
+    let octave: i32 = octave_str.trim().parse().ok()?;
+    let midi = (octave + 1) * 12 + base + accidental;
+    if midi >= 0 && midi <= 127 { Some(midi as u8) } else { None }
+}
