@@ -10,8 +10,9 @@ path = "src/main.rs"
 [dependencies]
 jack = "0.13"
 midir = "0.9"
-symphonia = { version = "0.5", default-features = false, features = ["flac"] }
+symphonia = { version = "0.5", default-features = false, features = ["flac", "wav", "pcm"] }
 crossbeam-channel = "0.5"
+crossterm = "0.27"
 
 [profile.release]
 opt-level = 3

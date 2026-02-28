@@ -4,80 +4,9 @@
 ///   sample, lokey, hikey, lovel, hivel, pitch_keycenter,
 ///   amp_veltrack, ampeg_release, volume, trigger, rt_decay,
 ///   lorand, hirand, on_locc64, on_hicc64, group, off_by, pitch_keytrack
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Trigger {
-    Attack,
-    Release,
-}
-
-impl Default for Trigger {
-    fn default() -> Self {
-        Trigger::Attack
-    }
-}
-
-/// One parsed SFZ region with all relevant opcode values resolved
-/// (group defaults merged with region overrides).
-#[derive(Debug, Clone)]
-pub struct Region {
-    /// Absolute path to the sample file
-    pub sample: PathBuf,
-    pub lokey: u8,
-    pub hikey: u8,
-    pub lovel: u8,
-    pub hivel: u8,
-    pub pitch_keycenter: u8,
-    /// Velocity sensitivity as a percentage (0-100+). Default 100.
-    pub amp_veltrack: f32,
-    /// Release time in seconds. Default 0.
-    pub ampeg_release: f32,
-    /// Gain in dB. Default 0.
-    pub volume: f32,
-    pub trigger: Trigger,
-    /// Release trigger decay in dB/s. Default 0.
-    pub rt_decay: f32,
-    /// Random range low (0.0-1.0). Default 0.
-    pub lorand: f32,
-    /// Random range high (0.0-1.0). Default 1.
-    pub hirand: f32,
-    /// CC64 (sustain pedal) low value for trigger. None = not a pedal region.
-    pub on_locc64: Option<u8>,
-    /// CC64 (sustain pedal) high value for trigger. None = not a pedal region.
-    pub on_hicc64: Option<u8>,
-    /// Voice group number (for exclusion). None = no group.
-    pub group: Option<u32>,
-    /// Group that mutes this voice when it starts. None = no exclusion.
-    pub off_by: Option<u32>,
-    /// Pitch tracking in cents per semitone. Default 100.
-    pub pitch_keytrack: f32,
-}
-
-impl Default for Region {
-    fn default() -> Self {
-        Region {
-            sample: PathBuf::new(),
-            lokey: 0,
-            hikey: 127,
-            lovel: 0,
-            hivel: 127,
-            pitch_keycenter: 60,
-            amp_veltrack: 100.0,
-            ampeg_release: 0.0,
-            volume: 0.0,
-            trigger: Trigger::Attack,
-            rt_decay: 0.0,
-            lorand: 0.0,
-            hirand: 1.0,
-            on_locc64: None,
-            on_hicc64: None,
-            group: None,
-            off_by: None,
-            pitch_keytrack: 100.0,
-        }
-    }
-}
+pub use crate::region::{Region, Trigger};
 
 /// Accumulates opcode state for a <group> header.
 #[derive(Debug, Clone, Default)]
@@ -121,23 +50,20 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<Vec<Region>, String> {
             continue;
         }
 
-        // Tokenise: split on whitespace but we need to handle <header> tokens
+        // Tokenise: split on whitespace but handle <header> tokens
         // mixed with opcode=value tokens on the same line.
         let mut tokens: Vec<&str> = Vec::new();
         let mut rest = line;
         while !rest.is_empty() {
             rest = rest.trim_start();
             if rest.starts_with('<') {
-                // Header token
                 if let Some(end) = rest.find('>') {
                     tokens.push(&rest[..end + 1]);
                     rest = &rest[end + 1..];
                 } else {
-                    // Malformed, skip
                     break;
                 }
             } else {
-                // Find next whitespace or end
                 let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
                 tokens.push(&rest[..end]);
                 rest = &rest[end..];
@@ -149,33 +75,26 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<Vec<Region>, String> {
                 let header = &token[1..token.len() - 1];
                 match header {
                     "group" => {
-                        // Save any in-progress region
                         if in_region {
                             regions.push(current_region.clone());
                             in_region = false;
                         }
-                        // Reset group state
                         group = GroupState::default();
                         current_region = Region::default();
                     }
                     "region" => {
-                        // Save any in-progress region
                         if in_region {
                             regions.push(current_region.clone());
                         }
-                        // Start new region, inheriting group defaults
                         current_region = region_from_group(&group);
                         in_region = true;
                     }
-                    _ => {
-                        // Ignore other headers (control, etc.)
-                    }
+                    _ => {}
                 }
             } else if let Some(eq_pos) = token.find('=') {
                 let key = &token[..eq_pos];
                 let val = &token[eq_pos + 1..];
 
-                // Apply opcode to current context
                 if in_region {
                     apply_opcode_to_region(&mut current_region, key, val, base_dir);
                 } else {
@@ -185,7 +104,6 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<Vec<Region>, String> {
         }
     }
 
-    // Save last region
     if in_region {
         regions.push(current_region);
     }
@@ -235,7 +153,6 @@ fn apply_opcode_to_group(g: &mut GroupState, key: &str, val: &str) {
 fn apply_opcode_to_region(r: &mut Region, key: &str, val: &str, base_dir: &Path) {
     match key {
         "sample" => {
-            // Normalise backslash (Windows paths in SFZ files)
             let normalized = val.replace('\\', "/");
             r.sample = base_dir.join(&normalized);
         }
@@ -271,12 +188,10 @@ fn parse_trigger(val: &str) -> Option<Trigger> {
 /// Parse a key that is either a MIDI note number (integer) or a note name
 /// like "C4", "D#1", "Bb3".
 fn parse_key(val: &str) -> Option<u8> {
-    // Try numeric first
     if let Ok(n) = val.parse::<i32>() {
         if n >= 0 && n <= 127 { return Some(n as u8); }
         return None;
     }
-    // Parse note name
     let val = val.trim();
     if val.is_empty() { return None; }
     let mut chars = val.chars().peekable();

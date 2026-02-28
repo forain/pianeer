@@ -42,12 +42,6 @@ pub fn start_midi(tx: Sender<MidiEvent>) -> Result<MidiConnection, String> {
             "pianosampler-input",
             move |_timestamp_us, raw, _| {
                 if let Some(event) = parse_midi(raw) {
-                    if matches!(event, crate::sampler::MidiEvent::NoteOn { .. }) {
-                        let t = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default();
-                        eprintln!("[MIDI] NoteOn at {:.3}s", t.as_secs_f64());
-                    }
                     let _ = tx.send(event);
                 }
             },
