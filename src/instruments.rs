@@ -37,7 +37,7 @@ pub fn find_samples_dir() -> Option<PathBuf> {
 fn is_instrument_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
-        Some("sfz") | Some("organ") | Some("nki") | Some("nkm")
+        Some("sfz") | Some("organ") | Some("nki") | Some("nkm") | Some("gig")
     )
 }
 

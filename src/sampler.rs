@@ -10,7 +10,7 @@ use crate::region::{Region, Trigger};
 /// A loaded audio sample — stereo interleaved f32 PCM.
 pub struct LoadedSample {
     /// Stereo interleaved frames: [L0, R0, L1, R1, …]
-    pub data: Vec<f32>,
+    pub data: std::sync::Arc<Vec<f32>>,
     /// Number of stereo frames.
     pub frames: usize,
     /// Loop start position in frames (None = no loop).

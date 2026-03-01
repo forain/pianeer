@@ -2,6 +2,7 @@ mod region;
 mod sfz;
 mod organ;
 mod kontakt;
+mod gig;
 mod sampler;
 mod midi;
 mod instruments;

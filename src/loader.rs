@@ -161,7 +161,7 @@ fn load_sample(path: &Path, loop_start: Option<u64>, loop_end: Option<u64>) -> R
 
     let frames = pcm.len() / 2;
     Ok(LoadedSample {
-        data: pcm,
+        data: std::sync::Arc::new(pcm),
         frames,
         loop_start: loop_start.map(|v| v as usize),
         loop_end: loop_end.map(|v| v as usize),
@@ -251,6 +251,19 @@ pub fn load_instrument_data(inst: &Instrument) -> Result<LoadedInstrument, Strin
             let regions = crate::kontakt::parse_kontakt(&inst.path)
                 .map_err(|e| format!("Error parsing NKI/NKM: {}", e))?;
             (regions, [0u8; 128], 0u8, 0u8, None)
+        }
+        "gig" => {
+            let (regions, samples) = crate::gig::parse_gig(&inst.path)
+                .map_err(|e| format!("Error parsing GIG: {}", e))?;
+            println!("All samples loaded.");
+            return Ok(LoadedInstrument {
+                regions,
+                samples,
+                cc_defaults: [0u8; 128],
+                sw_lokey: 0,
+                sw_hikey: 0,
+                sw_default: None,
+            });
         }
         other => return Err(format!("Unknown file extension '{}'", other)),
     };
