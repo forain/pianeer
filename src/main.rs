@@ -24,7 +24,7 @@ use jack::{AudioOut, ClientOptions};
 use sampler::{MidiEvent, SamplerState};
 use audio::{Notifications, PianoProcessor};
 use loader::{load_instrument_data, probe_sample_rate};
-use ui::{stop_playback, playing_idx, print_menu, MenuItem, MenuAction, PlaybackState};
+use ui::{stop_playback, playing_idx, print_menu, MenuItem, MenuAction, PlaybackState, Settings};
 
 fn main() {
     // 1. Find samples directory.
@@ -75,6 +75,7 @@ fn main() {
     let probed_rate: Option<u32> = regions.iter()
         .find(|r| !r.sample.as_os_str().is_empty())
         .and_then(|r| probe_sample_rate(&r.sample));
+
 
     if let Some(rate) = probed_rate {
         let existing = std::env::var("PIPEWIRE_PROPS").unwrap_or_default();
@@ -189,7 +190,9 @@ fn main() {
 
     // 14. Enable raw mode and show menu.
     terminal::enable_raw_mode().expect("Failed to enable raw mode");
-    print_menu(&menu, 0, 0, None);
+    let mut settings = Settings::default();
+    let mut sustain_prev = false;
+    print_menu(&menu, 0, 0, None, &settings, sustain_prev);
 
     // 15. Set up quit/reload flags and action channel.
     let quit = Arc::new(AtomicBool::new(false));
@@ -225,8 +228,38 @@ fn main() {
                             KeyCode::Down => {
                                 let _ = action_tx.try_send(MenuAction::CursorDown);
                             }
+                            KeyCode::Left => {
+                                let _ = action_tx.try_send(MenuAction::CycleVariant(-1));
+                            }
+                            KeyCode::Right => {
+                                let _ = action_tx.try_send(MenuAction::CycleVariant(1));
+                            }
                             KeyCode::Enter => {
                                 let _ = action_tx.try_send(MenuAction::Select);
+                            }
+                            KeyCode::Char('v') | KeyCode::Char('V') => {
+                                let _ = action_tx.try_send(MenuAction::CycleVeltrack);
+                            }
+                            KeyCode::Char('t') | KeyCode::Char('T') => {
+                                let _ = action_tx.try_send(MenuAction::CycleTune);
+                            }
+                            KeyCode::Char('e') | KeyCode::Char('E') => {
+                                let _ = action_tx.try_send(MenuAction::ToggleRelease);
+                            }
+                            KeyCode::Char('+') | KeyCode::Char('=') => {
+                                let _ = action_tx.try_send(MenuAction::VolumeChange(1));
+                            }
+                            KeyCode::Char('-') => {
+                                let _ = action_tx.try_send(MenuAction::VolumeChange(-1));
+                            }
+                            KeyCode::Char('[') => {
+                                let _ = action_tx.try_send(MenuAction::TransposeChange(-1));
+                            }
+                            KeyCode::Char(']') => {
+                                let _ = action_tx.try_send(MenuAction::TransposeChange(1));
+                            }
+                            KeyCode::Char('h') | KeyCode::Char('H') => {
+                                let _ = action_tx.try_send(MenuAction::ToggleResonance);
                             }
                             _ => {}
                         }
@@ -240,6 +273,9 @@ fn main() {
 
     // 17. Main loop: handle quit, reload, instrument switches, and MIDI file playback.
     let mut current = 0usize; // index in `menu` of the loaded instrument
+    let mut current_path = menu.iter()
+        .find_map(|m| if let MenuItem::Instrument(i) = m { Some(i.path().clone()) } else { None })
+        .unwrap_or_default();
     let mut cursor = 0usize;  // index of the highlighted menu row
     let mut playback: Option<PlaybackState> = None;
     loop {
@@ -252,10 +288,17 @@ fn main() {
             break;
         }
 
+        // Sustain pedal indicator: poll and redraw only on change.
+        let sustain_now = state.try_lock().map(|s| s.sustain_pedal).unwrap_or(sustain_prev);
+        if sustain_now != sustain_prev {
+            sustain_prev = sustain_now;
+            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+        }
+
         // Rescan instruments and MIDI files on R.
         if reload.swap(false, Ordering::SeqCst) {
-            let current_path = match menu.get(current) {
-                Some(MenuItem::Instrument(i)) => Some(i.path.clone()),
+            let saved_path = match menu.get(current) {
+                Some(MenuItem::Instrument(i)) => Some(i.path().clone()),
                 _ => None,
             };
             let new_instruments = instruments::discover(&samples_dir);
@@ -269,14 +312,17 @@ fn main() {
                 new_menu.push(MenuItem::MidiFile { name, path });
             }
             // Keep current index pointing at the same instrument if still present.
-            current = current_path
+            current = saved_path
                 .and_then(|p| new_menu.iter().position(|m| {
-                    matches!(m, MenuItem::Instrument(i) if i.path == p)
+                    matches!(m, MenuItem::Instrument(i) if i.path() == &p)
                 }))
                 .unwrap_or(0);
             cursor = cursor.min(new_menu.len().saturating_sub(1));
             menu = new_menu;
-            print_menu(&menu, cursor, current, playing_idx(&playback));
+            current_path = menu.get(current)
+                .and_then(|m| if let MenuItem::Instrument(i) = m { Some(i.path().clone()) } else { None })
+                .unwrap_or_default();
+            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
             continue;
         }
 
@@ -284,7 +330,7 @@ fn main() {
         if let Some(ref p) = playback {
             if p.done.load(Ordering::Relaxed) {
                 playback = None;
-                print_menu(&menu, cursor, current, None);
+                print_menu(&menu, cursor, current, None, &settings, sustain_prev);
             }
         }
 
@@ -292,20 +338,71 @@ fn main() {
             match action {
                 MenuAction::CursorUp => {
                     if cursor > 0 { cursor -= 1; }
-                    print_menu(&menu, cursor, current, playing_idx(&playback));
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
                 }
                 MenuAction::CursorDown => {
                     if cursor + 1 < menu.len() { cursor += 1; }
-                    print_menu(&menu, cursor, current, playing_idx(&playback));
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                }
+                MenuAction::CycleVariant(dir) => {
+                    if let Some(MenuItem::Instrument(inst)) = menu.get_mut(cursor) {
+                        inst.cycle_variant(dir);
+                    }
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                }
+                MenuAction::CycleVeltrack => {
+                    settings.veltrack = settings.veltrack.cycle();
+                    if let Ok(ref mut s) = state.lock() {
+                        s.veltrack_override = settings.veltrack.override_pct();
+                    }
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                }
+                MenuAction::CycleTune => {
+                    settings.tune = settings.tune.cycle();
+                    if let Ok(ref mut s) = state.lock() {
+                        s.master_tune_semitones = settings.tune.semitones();
+                    }
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                }
+                MenuAction::ToggleRelease => {
+                    settings.release_enabled = !settings.release_enabled;
+                    if let Ok(ref mut s) = state.lock() {
+                        s.release_enabled = settings.release_enabled;
+                    }
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                }
+                MenuAction::VolumeChange(delta) => {
+                    settings.volume_db = (settings.volume_db + delta as f32 * 3.0).clamp(-12.0, 12.0);
+                    if let Ok(ref mut s) = state.lock() {
+                        s.master_volume = 10.0_f32.powf(settings.volume_db / 20.0);
+                    }
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                }
+                MenuAction::TransposeChange(delta) => {
+                    settings.transpose = (settings.transpose + delta as i32).clamp(-12, 12);
+                    if let Ok(ref mut s) = state.lock() {
+                        s.transpose = settings.transpose;
+                    }
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                }
+                MenuAction::ToggleResonance => {
+                    settings.resonance_enabled = !settings.resonance_enabled;
+                    if let Ok(ref mut s) = state.lock() {
+                        s.resonance_enabled = settings.resonance_enabled;
+                    }
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
                 }
                 MenuAction::Select => {
                     let idx = cursor;
                     match &menu[idx] {
-                        MenuItem::Instrument(inst) if idx != current => {
+                        MenuItem::Instrument(inst)
+                            if idx != current || inst.path() != &current_path =>
+                        {
                             // Drain rapid key repeats; keep MIDI playing across instrument switches.
                             while action_rx.try_recv().is_ok() {}
                             terminal::disable_raw_mode().ok();
                             println!("\r\nLoading {}...", inst.name);
+                            let new_path = inst.path().clone();
                             match load_instrument_data(inst) {
                                 Ok(loaded) => {
                                     if let Ok(ref mut s) = state.lock() {
@@ -316,11 +413,12 @@ fn main() {
                                         );
                                     }
                                     current = idx;
+                                    current_path = new_path;
                                 }
                                 Err(e) => eprintln!("Error loading instrument: {}", e),
                             }
                             terminal::enable_raw_mode().ok();
-                            print_menu(&menu, cursor, current, playing_idx(&playback));
+                            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
                         }
                         MenuItem::MidiFile { path, .. } => {
                             let path = path.clone();
@@ -339,7 +437,7 @@ fn main() {
                                     _handle: handle, menu_idx: idx,
                                 });
                             }
-                            print_menu(&menu, cursor, current, playing_idx(&playback));
+                            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
                         }
                         _ => {} // same instrument re-selected, ignore
                     }

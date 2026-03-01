@@ -2,7 +2,24 @@ use std::path::{Path, PathBuf};
 
 pub struct Instrument {
     pub name: String,
-    pub path: PathBuf,
+    pub variants: Vec<(String, PathBuf)>,   // (display_name, path)
+    pub variant_idx: usize,
+}
+
+impl Instrument {
+    pub fn path(&self) -> &PathBuf { &self.variants[self.variant_idx].1 }
+
+    /// Returns variant display name only when >1 variant exists.
+    pub fn variant_name(&self) -> Option<&str> {
+        if self.variants.len() > 1 { Some(&self.variants[self.variant_idx].0) }
+        else { None }
+    }
+
+    pub fn cycle_variant(&mut self, dir: i8) {
+        if self.variants.is_empty() { return; }
+        let n = self.variants.len() as i32;
+        self.variant_idx = ((self.variant_idx as i32 + dir as i32).rem_euclid(n)) as usize;
+    }
 }
 
 /// Find the `samples/` directory by checking a few common locations.
@@ -46,10 +63,9 @@ fn is_nki(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("nki")
 }
 
-/// Scan one (or two) levels of subdirectories in `samples_dir` for `.sfz` and `.organ` files.
-/// If a subdirectory contains no instrument files directly, its subdirectories are checked one
-/// level deeper, and the best file in each (preferring any name containing "recommended") is
-/// included. Returns up to 9 instruments sorted alphabetically.
+/// Scan one (or two) levels of subdirectories in `samples_dir` for instrument files.
+/// Files in the same directory are grouped as variants of a single Instrument entry.
+/// Returns up to 16 instruments sorted alphabetically.
 pub fn discover(samples_dir: &Path) -> Vec<Instrument> {
     let mut instruments = Vec::new();
 
@@ -81,7 +97,7 @@ pub fn discover(samples_dir: &Path) -> Vec<Instrument> {
         // of the same programs).
         let has_nki = entries.iter().any(|e| is_nki(&e.path()));
 
-        let mut found_direct = false;
+        let mut direct_files: Vec<(String, PathBuf)> = Vec::new();
         for subentry in &entries {
             let file_path = subentry.path();
             if !is_instrument_file(&file_path) {
@@ -91,18 +107,30 @@ pub fn discover(samples_dir: &Path) -> Vec<Instrument> {
             if has_nki && file_path.extension().and_then(|e| e.to_str()) == Some("nkm") {
                 continue;
             }
-            let filename = match file_path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-            instruments.push(Instrument {
-                name: format!("{} / {}", subdir_name, filename),
-                path: file_path,
-            });
-            found_direct = true;
+            let stem = file_path.file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            direct_files.push((stem, file_path));
         }
 
-        if !found_direct {
+        if !direct_files.is_empty() {
+            if direct_files.len() == 1 {
+                let (stem, file_path) = direct_files.remove(0);
+                let name = format!("{} / {}", subdir_name, stem);
+                instruments.push(Instrument {
+                    name,
+                    variants: vec![(stem, file_path)],
+                    variant_idx: 0,
+                });
+            } else {
+                instruments.push(Instrument {
+                    name: subdir_name.clone(),
+                    variants: direct_files,
+                    variant_idx: 0,
+                });
+            }
+        } else {
             // No instrument files directly in this subdir — look one level deeper.
             let mut nested_subdirs: Vec<_> = entries
                 .into_iter()
@@ -134,13 +162,15 @@ pub fn discover(samples_dir: &Path) -> Vec<Instrument> {
                     .unwrap_or(&sfz_files[0]);
 
                 let file_path = best.path();
-                let filename = match file_path.file_name().and_then(|n| n.to_str()) {
+                let stem = match file_path.file_stem().and_then(|n| n.to_str()) {
                     Some(n) => n.to_string(),
                     None => continue,
                 };
+                let name = format!("{} / {} / {}", subdir_name, nested_name, stem);
                 instruments.push(Instrument {
-                    name: format!("{} / {} / {}", subdir_name, nested_name, filename),
-                    path: file_path,
+                    name,
+                    variants: vec![(stem, file_path)],
+                    variant_idx: 0,
                 });
             }
         }

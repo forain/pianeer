@@ -77,7 +77,7 @@ pub struct SamplerState {
     pub regions: Vec<Region>,
     pub samples: Vec<Option<LoadedSample>>,
     voices: Vec<Option<Voice>>,
-    sustain_pedal: bool,
+    pub sustain_pedal: bool,
     sample_rate: f64,
     midi_rx: Receiver<MidiEvent>,
     /// Cumulative frame counter, incremented at the start of each process() call.
@@ -90,6 +90,18 @@ pub struct SamplerState {
     sw_lokey: u8,
     /// Keyswitch range high (inclusive).
     sw_hikey: u8,
+    /// None = per-region veltrack; Some(x) = override all regions with x%.
+    pub veltrack_override: Option<f32>,
+    /// Global pitch shift in semitones (from master tune preset).
+    pub master_tune_semitones: f32,
+    /// When false, release-trigger voice spawning is suppressed.
+    pub release_enabled: bool,
+    /// Linear gain applied to output (derived from volume_db).
+    pub master_volume: f32,
+    /// Semitone offset applied to incoming notes.
+    pub transpose: i32,
+    /// When false, regions whose sample filename starts with "harm" are skipped.
+    pub resonance_enabled: bool,
 }
 
 impl SamplerState {
@@ -115,6 +127,12 @@ impl SamplerState {
             active_keyswitch: sw_default,
             sw_lokey,
             sw_hikey,
+            veltrack_override: None,
+            master_tune_semitones: 0.0,
+            release_enabled: true,
+            master_volume: 1.0,
+            transpose: 0,
+            resonance_enabled: true,
         }
     }
 
@@ -189,6 +207,14 @@ impl SamplerState {
             }
         }
 
+        // Apply master volume.
+        if self.master_volume != 1.0 {
+            for i in 0..n_frames {
+                out_l[i] *= self.master_volume;
+                out_r[i] *= self.master_volume;
+            }
+        }
+
         // Retire finished voices.
         for slot in self.voices.iter_mut() {
             let done = if let Some(ref v) = slot {
@@ -248,6 +274,8 @@ impl SamplerState {
     }
 
     fn note_on(&mut self, note: u8, velocity: u8) {
+        let note = (note as i32 + self.transpose).clamp(0, 127) as u8;
+
         // Keyswitch: if note is in the keyswitch range, update active keyswitch and return.
         if self.sw_lokey <= self.sw_hikey
             && note >= self.sw_lokey
@@ -288,6 +316,15 @@ impl SamplerState {
             if !cc_conds_met(&region.cc_conds, &self.cc_values) {
                 continue;
             }
+            // Resonance filter: skip regions whose sample filename starts with "harm".
+            if !self.resonance_enabled {
+                let fname = region.sample.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                if fname.to_ascii_lowercase().starts_with("harm") {
+                    continue;
+                }
+            }
             to_spawn.push((idx, region.group.unwrap_or(0)));
         }
 
@@ -307,6 +344,8 @@ impl SamplerState {
     }
 
     fn note_off(&mut self, note: u8) {
+        let note = (note as i32 + self.transpose).clamp(0, 127) as u8;
+
         // Compute how long the note was held (for rt_decay on release voices).
         let held_frames = self.voices.iter()
             .filter_map(|s| s.as_ref())
@@ -329,58 +368,60 @@ impl SamplerState {
             }
         }
 
-        // Spawn release-trigger voices.
-        let rand_val = rand_f32();
-        let mut release_regions: Vec<usize> = Vec::new();
-        for (idx, region) in self.regions.iter().enumerate() {
-            if region.trigger != Trigger::Release {
-                continue;
-            }
-            if !region.cc_trigger.is_empty() {
-                continue;
-            }
-            if note < region.lokey || note > region.hikey {
-                continue;
-            }
-            if rand_val < region.lorand {
-                continue;
-            }
-            if region.hirand < 1.0 && rand_val >= region.hirand {
-                continue;
-            }
-            if let Some(sw) = region.sw_last {
-                if self.active_keyswitch != Some(sw) {
+        // Spawn release-trigger voices (only when release is enabled).
+        if self.release_enabled {
+            let rand_val = rand_f32();
+            let mut release_regions: Vec<usize> = Vec::new();
+            for (idx, region) in self.regions.iter().enumerate() {
+                if region.trigger != Trigger::Release {
                     continue;
                 }
+                if !region.cc_trigger.is_empty() {
+                    continue;
+                }
+                if note < region.lokey || note > region.hikey {
+                    continue;
+                }
+                if rand_val < region.lorand {
+                    continue;
+                }
+                if region.hirand < 1.0 && rand_val >= region.hirand {
+                    continue;
+                }
+                if let Some(sw) = region.sw_last {
+                    if self.active_keyswitch != Some(sw) {
+                        continue;
+                    }
+                }
+                if !cc_conds_met(&region.cc_conds, &self.cc_values) {
+                    continue;
+                }
+                release_regions.push(idx);
             }
-            if !cc_conds_met(&region.cc_conds, &self.cc_values) {
-                continue;
-            }
-            release_regions.push(idx);
-        }
 
-        // If any candidate has a timed MaxKeyPressTime (>= 0), use organ-style
-        // selection: pick the one with the smallest limit that is still >= held_ms,
-        // falling back to the unlimited (-1) candidate.
-        // Otherwise (all -1, e.g. SFZ) spawn all of them.
-        let held_ms = (held_secs * 1000.0) as i32;
-        let has_timed = release_regions.iter()
-            .any(|&i| self.regions[i].max_key_press_ms >= 0);
-        if has_timed {
-            let best = release_regions.iter().copied()
-                .filter(|&i| {
-                    let ms = self.regions[i].max_key_press_ms;
-                    ms >= 0 && ms >= held_ms
-                })
-                .min_by_key(|&i| self.regions[i].max_key_press_ms)
-                .or_else(|| release_regions.iter().copied()
-                    .find(|&i| self.regions[i].max_key_press_ms < 0));
-            if let Some(region_idx) = best {
-                self.spawn_release_voice(region_idx, note, 64, held_secs);
-            }
-        } else {
-            for region_idx in release_regions {
-                self.spawn_release_voice(region_idx, note, 64, held_secs);
+            // If any candidate has a timed MaxKeyPressTime (>= 0), use organ-style
+            // selection: pick the one with the smallest limit that is still >= held_ms,
+            // falling back to the unlimited (-1) candidate.
+            // Otherwise (all -1, e.g. SFZ) spawn all of them.
+            let held_ms = (held_secs * 1000.0) as i32;
+            let has_timed = release_regions.iter()
+                .any(|&i| self.regions[i].max_key_press_ms >= 0);
+            if has_timed {
+                let best = release_regions.iter().copied()
+                    .filter(|&i| {
+                        let ms = self.regions[i].max_key_press_ms;
+                        ms >= 0 && ms >= held_ms
+                    })
+                    .min_by_key(|&i| self.regions[i].max_key_press_ms)
+                    .or_else(|| release_regions.iter().copied()
+                        .find(|&i| self.regions[i].max_key_press_ms < 0));
+                if let Some(region_idx) = best {
+                    self.spawn_release_voice(region_idx, note, 64, held_secs);
+                }
+            } else {
+                for region_idx in release_regions {
+                    self.spawn_release_voice(region_idx, note, 64, held_secs);
+                }
             }
         }
     }
@@ -512,9 +553,12 @@ impl SamplerState {
 
     fn spawn_voice(&mut self, region_idx: usize, note: u8, velocity: u8, is_release_trigger: bool) {
         let cc = &self.cc_values;
+        let extra_semitones = self.master_tune_semitones;
+        let veltrack_override = self.veltrack_override;
         let (playback_rate, amplitude, release_time, group, off_by, pan_l, pan_r, start_pos, off_time) = {
             let region = &self.regions[region_idx];
-            let eff_veltrack = effective_veltrack(region, cc);
+            let eff_veltrack = veltrack_override
+                .unwrap_or_else(|| effective_veltrack(region, cc));
             let eff_amp = compute_amplitude(velocity, region, eff_veltrack)
                 * amplitude_multiplier(region, cc);
             let eff_pan = effective_pan(region, cc);
@@ -522,7 +566,7 @@ impl SamplerState {
             let start = effective_offset(region, cc);
             let angle = std::f32::consts::FRAC_PI_4 * (eff_pan / 100.0 + 1.0);
             (
-                compute_playback_rate(note, region),
+                compute_playback_rate(note, region, extra_semitones),
                 eff_amp,
                 eff_release,
                 region.group,
@@ -557,16 +601,19 @@ impl SamplerState {
 
     fn spawn_release_voice(&mut self, region_idx: usize, note: u8, velocity: u8, held_secs: f32) {
         let cc = &self.cc_values;
+        let extra_semitones = self.master_tune_semitones;
+        let veltrack_override = self.veltrack_override;
         let (playback_rate, mut amplitude, release_time, group, off_by, rt_decay, pan_l, pan_r, off_time) = {
             let region = &self.regions[region_idx];
-            let eff_veltrack = effective_veltrack(region, cc);
+            let eff_veltrack = veltrack_override
+                .unwrap_or_else(|| effective_veltrack(region, cc));
             let eff_amp = compute_amplitude(velocity, region, eff_veltrack)
                 * amplitude_multiplier(region, cc);
             let eff_pan = effective_pan(region, cc);
             let eff_release = effective_release(region, cc).max(0.1);
             let angle = std::f32::consts::FRAC_PI_4 * (eff_pan / 100.0 + 1.0);
             (
-                compute_playback_rate(note, region),
+                compute_playback_rate(note, region, extra_semitones),
                 eff_amp,
                 eff_release,
                 region.group,
@@ -726,10 +773,11 @@ fn decay_per_sample(release_time_s: f64, sample_rate: f64) -> f32 {
     (SILENCE_AMPLITUDE as f64).powf(1.0 / n_samples) as f32
 }
 
-fn compute_playback_rate(note: u8, region: &Region) -> f64 {
+fn compute_playback_rate(note: u8, region: &Region, extra_semitones: f32) -> f64 {
     let semitones = (note as f64 - region.pitch_keycenter as f64)
         * (region.pitch_keytrack as f64 / 100.0)
-        + region.tune_cents as f64 / 100.0;
+        + region.tune_cents as f64 / 100.0
+        + extra_semitones as f64;
     2.0_f64.powf(semitones / 12.0)
 }
 
