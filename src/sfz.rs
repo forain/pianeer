@@ -222,9 +222,11 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<(Vec<Region>, SfzMeta), String> {
 
     let mut regions = Vec::new();
     let mut global = GroupState::default();
+    let mut master = GroupState::default();
     let mut group = GroupState::default();
     let mut in_region = false;
     let mut in_global = false;
+    let mut in_master = false;
     let mut in_control = false;
     let mut current_region = Region::default();
     let mut default_path = PathBuf::new();
@@ -267,7 +269,9 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<(Vec<Region>, SfzMeta), String> {
                             in_region = false;
                         }
                         global = GroupState::default();
+                        master = GroupState::default();
                         in_global = true;
+                        in_master = false;
                         in_control = false;
                     }
                     "master" => {
@@ -275,8 +279,9 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<(Vec<Region>, SfzMeta), String> {
                             regions.push(current_region.clone());
                             in_region = false;
                         }
-                        // master inherits global; group-level opcodes override.
-                        group = global.clone();
+                        // master inherits global; opcodes between <master> and <group> go here.
+                        master = global.clone();
+                        in_master = true;
                         in_global = false;
                         in_control = false;
                     }
@@ -285,8 +290,9 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<(Vec<Region>, SfzMeta), String> {
                             regions.push(current_region.clone());
                             in_region = false;
                         }
-                        group = global.clone();
-                        current_region = Region::default();
+                        // group inherits from master (which inherits from global).
+                        group = master.clone();
+                        in_master = false;
                         in_global = false;
                         in_control = false;
                     }
@@ -296,6 +302,7 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<(Vec<Region>, SfzMeta), String> {
                         }
                         current_region = region_from_group(&group);
                         in_region = true;
+                        in_master = false;
                         in_global = false;
                         in_control = false;
                     }
@@ -305,6 +312,7 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<(Vec<Region>, SfzMeta), String> {
                             in_region = false;
                         }
                         in_control = true;
+                        in_master = false;
                         in_global = false;
                     }
                     _ => {}
@@ -319,6 +327,8 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<(Vec<Region>, SfzMeta), String> {
                     apply_opcode_to_region(&mut current_region, key, val, base_dir, &default_path);
                 } else if in_global {
                     apply_opcode_to_group(&mut global, key, val);
+                } else if in_master {
+                    apply_opcode_to_group(&mut master, key, val);
                 } else {
                     apply_opcode_to_group(&mut group, key, val);
                 }
