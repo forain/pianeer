@@ -13,7 +13,7 @@ pub struct MidiConnection {
 }
 
 pub fn start_midi(tx: Sender<MidiEvent>) -> Result<MidiConnection, String> {
-    let midi_in = MidiInput::new("pianosampler").map_err(|e| e.to_string())?;
+    let midi_in = MidiInput::new("pianeer").map_err(|e| e.to_string())?;
 
     let ports = midi_in.ports();
     if ports.is_empty() {
@@ -39,7 +39,7 @@ pub fn start_midi(tx: Sender<MidiEvent>) -> Result<MidiConnection, String> {
     let conn = midi_in
         .connect(
             port,
-            "pianosampler-input",
+            "pianeer-input",
             move |_timestamp_us, raw, _| {
                 if let Some(event) = parse_midi(raw) {
                     let _ = tx.send(event);

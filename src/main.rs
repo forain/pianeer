@@ -261,7 +261,7 @@ fn main() {
     };
 
     // 4. Create JACK client.
-    let (client, _status) = Client::new("pianosampler", ClientOptions::NO_START_SERVER)
+    let (client, _status) = Client::new("pianeer", ClientOptions::NO_START_SERVER)
         .expect("Failed to open JACK client. Is JACK/PipeWire running?");
 
     let sample_rate = client.sample_rate() as f64;

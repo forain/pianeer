@@ -1,4 +1,4 @@
-# pianosampler
+# pianeer
 
 A low-latency JACK audio sampler for keyboard instruments. Plays SFZ and Grand Orgue ODF instruments in response to MIDI input.
 
@@ -28,7 +28,7 @@ cargo build --release
 ## Running
 
 ```bash
-./target/release/pianosampler
+./target/release/pianeer
 ```
 
 Instruments are discovered automatically from `samples/` subdirectories. Place each instrument in its own subdirectory:
