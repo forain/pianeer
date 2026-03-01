@@ -38,10 +38,10 @@ pub struct Region {
     pub lorand: f32,
     /// Random range high (0.0–1.0).
     pub hirand: f32,
-    /// CC64 (sustain pedal) low value for trigger. None = not a pedal region.
-    pub on_locc64: Option<u8>,
-    /// CC64 (sustain pedal) high value for trigger.
-    pub on_hicc64: Option<u8>,
+    /// CC-event trigger conditions from `on_locc$N`/`on_hicc$N` opcodes.
+    /// Each entry is (cc_num, lo, hi): fires when CC cc_num changes to a value in [lo, hi].
+    /// Non-empty → this is a CC-event-triggered region, not a note-triggered region.
+    pub cc_trigger: Vec<(u8, u8, u8)>,
     /// Voice group number (for exclusion).
     pub group: Option<u32>,
     /// Group that mutes this voice when it starts.
@@ -104,8 +104,7 @@ impl Default for Region {
             rt_decay: 0.0,
             lorand: 0.0,
             hirand: 1.0,
-            on_locc64: None,
-            on_hicc64: None,
+            cc_trigger: Vec::new(),
             group: None,
             off_by: None,
             pitch_keytrack: 100.0,

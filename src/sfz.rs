@@ -37,8 +37,7 @@ struct GroupState {
     volume: Option<f32>,
     trigger: Option<Trigger>,
     rt_decay: Option<f32>,
-    on_locc64: Option<u8>,
-    on_hicc64: Option<u8>,
+    cc_trigger: Vec<(u8, u8, u8)>,
     group: Option<u32>,
     off_by: Option<u32>,
     pitch_keytrack: Option<f32>,
@@ -376,8 +375,7 @@ fn region_from_group(g: &GroupState) -> Region {
     if let Some(v) = g.volume { r.volume = v; }
     if let Some(ref v) = g.trigger { r.trigger = v.clone(); }
     if let Some(v) = g.rt_decay { r.rt_decay = v; }
-    r.on_locc64 = g.on_locc64;
-    r.on_hicc64 = g.on_hicc64;
+    r.cc_trigger = g.cc_trigger.clone();
     r.group = g.group;
     r.off_by = g.off_by;
     if let Some(v) = g.pitch_keytrack { r.pitch_keytrack = v; }
@@ -408,8 +406,6 @@ fn apply_opcode_to_group(g: &mut GroupState, key: &str, val: &str) {
         "volume" => g.volume = val.parse().ok(),
         "trigger" => g.trigger = parse_trigger(val),
         "rt_decay" => g.rt_decay = val.parse().ok(),
-        "on_locc64" => g.on_locc64 = val.parse().ok(),
-        "on_hicc64" => g.on_hicc64 = val.parse().ok(),
         "group" => g.group = val.parse().ok(),
         "off_by" => g.off_by = val.parse().ok(),
         "pitch_keytrack" => g.pitch_keytrack = val.parse().ok(),
@@ -436,7 +432,7 @@ fn apply_opcode_to_group(g: &mut GroupState, key: &str, val: &str) {
                 set_cc_mod(&mut g.ampeg_release_oncc, v.0, v.1);
             } else if let Some(v) = parse_oncc_val(key, val, "offset_oncc") {
                 g.offset_oncc = Some((v.0, v.1 as u64));
-            } else {
+            } else if !parse_on_cc_cond(key, val, &mut g.cc_trigger) {
                 parse_cc_cond(key, val, &mut g.cc_conds);
             }
         }
@@ -477,8 +473,6 @@ fn apply_opcode_to_region(
         "rt_decay" => { if let Ok(v) = val.parse() { r.rt_decay = v; } }
         "lorand" => { if let Ok(v) = val.parse() { r.lorand = v; } }
         "hirand" => { if let Ok(v) = val.parse() { r.hirand = v; } }
-        "on_locc64" => r.on_locc64 = val.parse().ok(),
-        "on_hicc64" => r.on_hicc64 = val.parse().ok(),
         "group" => r.group = val.parse().ok(),
         "off_by" => r.off_by = val.parse().ok(),
         "pitch_keytrack" => { if let Ok(v) = val.parse() { r.pitch_keytrack = v; } }
@@ -499,7 +493,7 @@ fn apply_opcode_to_region(
                 set_cc_mod(&mut r.ampeg_release_oncc, v.0, v.1);
             } else if let Some(v) = parse_oncc_val(key, val, "offset_oncc") {
                 r.offset_oncc = Some((v.0, v.1 as u64));
-            } else {
+            } else if !parse_on_cc_cond(key, val, &mut r.cc_trigger) {
                 parse_cc_cond(key, val, &mut r.cc_conds);
             }
         }
@@ -535,6 +529,29 @@ fn parse_cc_cond(key: &str, val: &str, conds: &mut Vec<(u8, u8, u8)>) {
     } else {
         conds.push((cc_num, 0, cc_val));
     }
+}
+
+/// Parse `on_locc$N` / `on_hicc$N` and insert/update a condition in `cc_trigger`.
+/// Returns true if the key was recognised (whether or not parsing succeeded).
+fn parse_on_cc_cond(key: &str, val: &str, conds: &mut Vec<(u8, u8, u8)>) -> bool {
+    let (is_lo, cc_str) = if let Some(s) = key.strip_prefix("on_locc") {
+        (true, s)
+    } else if let Some(s) = key.strip_prefix("on_hicc") {
+        (false, s)
+    } else {
+        return false;
+    };
+    let cc_num: u8 = match cc_str.parse() { Ok(v) => v, Err(_) => return true };
+    let cc_val: u8 = match val.parse() { Ok(v) => v, Err(_) => return true };
+
+    if let Some(entry) = conds.iter_mut().find(|(c, _, _)| *c == cc_num) {
+        if is_lo { entry.1 = cc_val; } else { entry.2 = cc_val; }
+    } else if is_lo {
+        conds.push((cc_num, cc_val, 127));
+    } else {
+        conds.push((cc_num, 0, cc_val));
+    }
+    true
 }
 
 /// Update or insert a (cc_num, value) entry in a CC-mod list.

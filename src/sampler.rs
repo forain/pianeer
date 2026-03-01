@@ -264,7 +264,7 @@ impl SamplerState {
             if region.trigger != Trigger::Attack {
                 continue;
             }
-            if region.on_locc64.is_some() || region.on_hicc64.is_some() {
+            if !region.cc_trigger.is_empty() {
                 continue;
             }
             if note < region.lokey || note > region.hikey {
@@ -336,7 +336,7 @@ impl SamplerState {
             if region.trigger != Trigger::Release {
                 continue;
             }
-            if region.on_locc64.is_some() || region.on_hicc64.is_some() {
+            if !region.cc_trigger.is_empty() {
                 continue;
             }
             if note < region.lokey || note > region.hikey {
@@ -401,8 +401,9 @@ impl SamplerState {
             let rand_val = rand_f32();
             let mut pedal_up_regions: Vec<usize> = Vec::new();
             for (idx, region) in self.regions.iter().enumerate() {
-                if let (Some(lo), Some(hi)) = (region.on_locc64, region.on_hicc64) {
-                    if lo == 0 && hi == 1 {
+                if let Some(&(_, lo, _hi)) = region.cc_trigger.iter().find(|&&(cc, _, _)| cc == 64) {
+                    // Fire if CC64=0 (pedal just released) satisfies the trigger range.
+                    if lo == 0 {
                         if rand_val >= region.lorand && (region.hirand >= 1.0 || rand_val < region.hirand) {
                             pedal_up_regions.push(idx);
                         }
@@ -417,8 +418,9 @@ impl SamplerState {
             let mut pedal_down_regions: Vec<usize> = Vec::new();
             let mut kill_groups: Vec<u32> = Vec::new();
             for (idx, region) in self.regions.iter().enumerate() {
-                if let (Some(lo), Some(hi)) = (region.on_locc64, region.on_hicc64) {
-                    if lo >= 64 && hi == 127 {
+                if let Some(&(_, lo, hi)) = region.cc_trigger.iter().find(|&&(cc, _, _)| cc == 64) {
+                    // Fire if CC64=127 (pedal just pressed) satisfies the trigger range.
+                    if 127 >= lo && 127 <= hi {
                         if rand_val >= region.lorand && (region.hirand >= 1.0 || rand_val < region.hirand) {
                             pedal_down_regions.push(idx);
                             if let Some(ob) = region.off_by {
