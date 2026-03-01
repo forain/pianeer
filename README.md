@@ -88,7 +88,20 @@ Grand Orgue ODF (`.organ`) files use an INI-style format with `[Organ]` and `[Ra
 
 ## Kontakt 2 support
 
-Reads `.nki` (single program) and `.nkm` (multi-program bank) files. The binary format contains a zlib-compressed XML payload describing groups, zones, and sample paths. Release groups (`releaseTrigger="yes"`) are mapped to `trigger=release` regions. When both `.nki` and `.nkm` files are present in the same directory, `.nkm` files are suppressed in the menu.
+Reads `.nki` (single program) and `.nkm` (multi-program bank) files. The binary format contains a zlib-compressed XML payload. `.nkm` files are suppressed in the menu when `.nki` files are present in the same directory.
+
+| Element | Attribute | Notes |
+|---------|-----------|-------|
+| `K2_Program` | `volume` | Program-level linear gain, converted to dB |
+| `K2_Group` | `releaseTrigger` | `"yes"` → `trigger=release`, otherwise `trigger=attack` |
+| `K2_Group` | `volume` | Group linear gain, added to program gain |
+| `K2_Group` > `Envelope` | `release` | Amplitude envelope release time in seconds |
+| `K2_Zone` | `groupIdx` | Links zone to its parent group |
+| `K2_Zone` | `lowKey`, `highKey` | MIDI note range |
+| `K2_Zone` | `rootKey` | Pitch centre for transposition |
+| `K2_Zone` | `lowVelocity`, `highVelocity` | Velocity range (1-based, converted to 0-based) |
+| `K2_Zone` | `zoneVolume` | Zone linear gain, added to group+program gain |
+| `K2_Zone` > `Sample` | `file_ex2` | Encoded sample path: `@d<len><dir>…F-<10flags><file>` |
 
 ## Architecture
 
