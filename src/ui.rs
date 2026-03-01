@@ -18,6 +18,19 @@ impl MenuItem {
             MenuItem::MidiFile { name, .. } => name,
         }
     }
+
+    pub fn type_label(&self) -> &'static str {
+        match self {
+            MenuItem::Instrument(i) => match i.path().extension().and_then(|e| e.to_str()) {
+                Some("sfz")          => "SFZ",
+                Some("organ")        => "ODF",
+                Some("nki") | Some("nkm") => "NKI",
+                Some("gig")          => "GIG",
+                _                    => "   ",
+            },
+            MenuItem::MidiFile { .. } => "MID",
+        }
+    }
 }
 
 pub struct PlaybackState {
@@ -25,6 +38,51 @@ pub struct PlaybackState {
     pub done: Arc<AtomicBool>,
     pub _handle: thread::JoinHandle<()>,
     pub menu_idx: usize,
+}
+
+// ── Runtime stats ─────────────────────────────────────────────────────────────
+
+#[derive(Default, PartialEq)]
+pub struct ProcStats {
+    pub cpu_pct: u8,   // 0–100 %
+    pub mem_mb: u32,   // resident set in MiB
+    pub voices: usize, // active voice count
+    pub peak_l: f32,   // smoothed peak, linear (0.0–1.0+)
+    pub peak_r: f32,
+    pub clip: bool,    // clip hold indicator (managed by main)
+}
+
+/// Render a coloured VU bar for `peak` (linear amplitude).
+/// Returns a string: 20-char coloured bar + dB value.
+fn vu_bar(peak: f32) -> String {
+    const WIDTH: usize = 20;
+    const DB_FLOOR: f32 = -48.0;
+    // Zone boundaries (in filled-bar chars at full scale):
+    //  green:  0..15  → -48 to -12 dB  (75 %)
+    //  yellow: 15..19 → -12 to  -3 dB  (next 20 %)
+    //  red:    19..20 →  -3 to   0 dB+ (top  5 %)
+    const GREEN_END: usize  = 15;
+    const YELLOW_END: usize = 19;
+
+    let db = if peak > 1e-10 { 20.0 * peak.log10() } else { -96.0_f32 };
+    let frac = ((db - DB_FLOOR) / (-DB_FLOOR)).clamp(0.0, 1.0);
+    let filled = (frac * WIDTH as f32).round() as usize;
+    let empty   = WIDTH - filled;
+
+    let green_n  = filled.min(GREEN_END);
+    let yellow_n = filled.saturating_sub(GREEN_END).min(YELLOW_END - GREEN_END);
+    let red_n    = filled.saturating_sub(YELLOW_END);
+
+    let green:  String = std::iter::repeat('█').take(green_n).collect();
+    let yellow: String = std::iter::repeat('█').take(yellow_n).collect();
+    let red:    String = std::iter::repeat('█').take(red_n).collect();
+    let empty:  String = std::iter::repeat('░').take(empty).collect();
+
+    let db_display = db.clamp(DB_FLOOR, 6.0);
+    format!(
+        "\x1b[32m{}\x1b[33m{}\x1b[31m{}\x1b[0m{} {:>+6.1}dB",
+        green, yellow, red, empty, db_display,
+    )
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
@@ -152,6 +210,7 @@ pub fn print_menu(
     playing: Option<usize>,
     settings: &Settings,
     sustain: bool,
+    stats: &ProcStats,
 ) {
     print!("\x1b[2J\x1b[H");
     print!("Pianeer  \u{2191}/\u{2193} nav  Enter load  \u{2190}/\u{2192} variant  R rescan  Q quit\r\n");
@@ -177,6 +236,12 @@ pub fn print_menu(
         if settings.resonance_enabled { "on" } else { "off" },
         sus_label,
     );
+    let clip_str = if stats.clip { "  \x1b[1;31m[CLIP]\x1b[0m" } else { "" };
+    print!(
+        "  CPU:{:3}%  Mem:{:4}MB  Voices:{}\r\n  L {}  R {}{}\r\n",
+        stats.cpu_pct, stats.mem_mb, stats.voices,
+        vu_bar(stats.peak_l), vu_bar(stats.peak_r), clip_str,
+    );
 
     let has_inst = menu.iter().any(|m| matches!(m, MenuItem::Instrument(_)));
     let mut in_midi = false;
@@ -195,6 +260,7 @@ pub fn print_menu(
         let is_playing = playing == Some(i);
         // Fixed-width tag column (9 chars) keeps titles aligned.
         let tag = if is_playing { "[playing]" } else if is_loaded { "[loaded] " } else { "         " };
+        let type_label = item.type_label();
         let title = item.display_name();
 
         // Append variant indicator for instruments with multiple variants.
@@ -209,9 +275,9 @@ pub fn print_menu(
         };
 
         if i == cursor {
-            print!("  {}  \x1b[7m{}{}\x1b[27m\r\n", tag, title, variant_suffix);
+            print!("  {}  {}  \x1b[7m{}{}\x1b[27m\r\n", tag, type_label, title, variant_suffix);
         } else {
-            print!("  {}  {}{}\r\n", tag, title, variant_suffix);
+            print!("  {}  {}  {}{}\r\n", tag, type_label, title, variant_suffix);
         }
     }
 

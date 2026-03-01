@@ -24,7 +24,34 @@ use jack::{AudioOut, ClientOptions};
 use sampler::{MidiEvent, SamplerState};
 use audio::{Notifications, PianoProcessor};
 use loader::{load_instrument_data, probe_sample_rate};
-use ui::{stop_playback, playing_idx, print_menu, MenuItem, MenuAction, PlaybackState, Settings};
+use ui::{stop_playback, playing_idx, print_menu, MenuItem, MenuAction, PlaybackState, Settings, ProcStats};
+
+/// Read cumulative CPU ticks (utime+stime) from /proc/self/stat.
+fn read_cpu_ticks() -> Option<u64> {
+    let data = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // comm field may contain spaces; find the last ')' to skip it.
+    let after_comm = data.rfind(')')?.checked_add(1)?;
+    let rest = data[after_comm..].trim_start();
+    // Fields after ')': state ppid pgrp session tty_nr tpgid flags
+    //                    minflt cminflt majflt cmajflt utime(11) stime(12)
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// Read resident set size in MiB from /proc/self/status.
+fn read_mem_mb() -> u32 {
+    let data = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    for line in data.lines() {
+        if line.starts_with("VmRSS:") {
+            if let Some(kb) = line.split_whitespace().nth(1).and_then(|s| s.parse::<u32>().ok()) {
+                return kb / 1024;
+            }
+        }
+    }
+    0
+}
 
 fn main() {
     // 1. Find samples directory.
@@ -192,7 +219,11 @@ fn main() {
     terminal::enable_raw_mode().expect("Failed to enable raw mode");
     let mut settings = Settings::default();
     let mut sustain_prev = false;
-    print_menu(&menu, 0, 0, None, &settings, sustain_prev);
+    let mut stats = ProcStats::default();
+    let mut prev_cpu_ticks: u64 = read_cpu_ticks().unwrap_or(0);
+    let mut prev_cpu_instant = std::time::Instant::now();
+    let mut clip_until: Option<std::time::Instant> = None;
+    print_menu(&menu, 0, 0, None, &settings, sustain_prev, &stats);
 
     // 15. Set up quit/reload flags and action channel.
     let quit = Arc::new(AtomicBool::new(false));
@@ -288,11 +319,44 @@ fn main() {
             break;
         }
 
-        // Sustain pedal indicator: poll and redraw only on change.
-        let sustain_now = state.try_lock().map(|s| s.sustain_pedal).unwrap_or(sustain_prev);
-        if sustain_now != sustain_prev {
-            sustain_prev = sustain_now;
-            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+        // Poll sampler state and system stats; redraw if anything changed.
+        let (sustain_now, voices_now, peak_l, peak_r, clip_now) = state.try_lock()
+            .map(|mut s| {
+                let clip = s.clip_l || s.clip_r;
+                s.clip_l = false;
+                s.clip_r = false;
+                (s.sustain_pedal, s.active_voice_count(), s.peak_l, s.peak_r, clip)
+            })
+            .unwrap_or((sustain_prev, stats.voices, stats.peak_l, stats.peak_r, false));
+
+        let now = std::time::Instant::now();
+        if clip_now {
+            clip_until = Some(now + std::time::Duration::from_secs(2));
+        }
+        let clip_holding = clip_until.map(|t| now < t).unwrap_or(false);
+
+        let elapsed = now.duration_since(prev_cpu_instant).as_secs_f32().max(0.001);
+        let ticks_now = read_cpu_ticks().unwrap_or(prev_cpu_ticks);
+        // CLK_TCK is 100 on virtually all Linux systems.
+        let cpu_pct = (((ticks_now.saturating_sub(prev_cpu_ticks)) as f32 / 100.0) / elapsed * 100.0)
+            .round().clamp(0.0, 100.0) as u8;
+        prev_cpu_ticks = ticks_now;
+        prev_cpu_instant = now;
+
+        let new_stats = ProcStats {
+            cpu_pct,
+            mem_mb: read_mem_mb(),
+            voices: voices_now,
+            peak_l,
+            peak_r,
+            clip: clip_holding,
+        };
+
+        let needs_redraw = sustain_now != sustain_prev || new_stats != stats;
+        sustain_prev = sustain_now;
+        stats = new_stats;
+        if needs_redraw {
+            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats);
         }
 
         // Rescan instruments and MIDI files on R.
@@ -322,7 +386,7 @@ fn main() {
             current_path = menu.get(current)
                 .and_then(|m| if let MenuItem::Instrument(i) = m { Some(i.path().clone()) } else { None })
                 .unwrap_or_default();
-            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats);
             continue;
         }
 
@@ -330,7 +394,7 @@ fn main() {
         if let Some(ref p) = playback {
             if p.done.load(Ordering::Relaxed) {
                 playback = None;
-                print_menu(&menu, cursor, current, None, &settings, sustain_prev);
+                print_menu(&menu, cursor, current, None, &settings, sustain_prev, &stats);
             }
         }
 
@@ -338,59 +402,59 @@ fn main() {
             match action {
                 MenuAction::CursorUp => {
                     if cursor > 0 { cursor -= 1; }
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats);
                 }
                 MenuAction::CursorDown => {
                     if cursor + 1 < menu.len() { cursor += 1; }
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats);
                 }
                 MenuAction::CycleVariant(dir) => {
                     if let Some(MenuItem::Instrument(inst)) = menu.get_mut(cursor) {
                         inst.cycle_variant(dir);
                     }
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats);
                 }
                 MenuAction::CycleVeltrack => {
                     settings.veltrack = settings.veltrack.cycle();
                     if let Ok(ref mut s) = state.lock() {
                         s.veltrack_override = settings.veltrack.override_pct();
                     }
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats);
                 }
                 MenuAction::CycleTune => {
                     settings.tune = settings.tune.cycle();
                     if let Ok(ref mut s) = state.lock() {
                         s.master_tune_semitones = settings.tune.semitones();
                     }
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats);
                 }
                 MenuAction::ToggleRelease => {
                     settings.release_enabled = !settings.release_enabled;
                     if let Ok(ref mut s) = state.lock() {
                         s.release_enabled = settings.release_enabled;
                     }
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats);
                 }
                 MenuAction::VolumeChange(delta) => {
                     settings.volume_db = (settings.volume_db + delta as f32 * 3.0).clamp(-12.0, 12.0);
                     if let Ok(ref mut s) = state.lock() {
                         s.master_volume = 10.0_f32.powf(settings.volume_db / 20.0);
                     }
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats);
                 }
                 MenuAction::TransposeChange(delta) => {
                     settings.transpose = (settings.transpose + delta as i32).clamp(-12, 12);
                     if let Ok(ref mut s) = state.lock() {
                         s.transpose = settings.transpose;
                     }
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats);
                 }
                 MenuAction::ToggleResonance => {
                     settings.resonance_enabled = !settings.resonance_enabled;
                     if let Ok(ref mut s) = state.lock() {
                         s.resonance_enabled = settings.resonance_enabled;
                     }
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats);
                 }
                 MenuAction::Select => {
                     let idx = cursor;
@@ -418,7 +482,7 @@ fn main() {
                                 Err(e) => eprintln!("Error loading instrument: {}", e),
                             }
                             terminal::enable_raw_mode().ok();
-                            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats);
                         }
                         MenuItem::MidiFile { path, .. } => {
                             let path = path.clone();
@@ -437,7 +501,7 @@ fn main() {
                                     _handle: handle, menu_idx: idx,
                                 });
                             }
-                            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev);
+                            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats);
                         }
                         _ => {} // same instrument re-selected, ignore
                     }

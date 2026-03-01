@@ -28,7 +28,7 @@ pub enum MidiEvent {
     AllNotesOff,
 }
 
-const MAX_VOICES: usize = 128;
+const MAX_VOICES: usize = 256;
 /// Amplitude below which a releasing voice is considered silent (linear).
 /// Corresponds to -96 dB: 10^(-96/20) ≈ 1.585e-5
 const SILENCE_AMPLITUDE: f32 = 1.585e-5;
@@ -102,6 +102,18 @@ pub struct SamplerState {
     pub transpose: i32,
     /// When false, regions whose sample filename starts with "harm" are skipped.
     pub resonance_enabled: bool,
+    /// Smoothed peak level for left output (0.0–1.0+). Decays at ~20 dB/s.
+    pub peak_l: f32,
+    /// Smoothed peak level for right output.
+    pub peak_r: f32,
+    /// Set whenever any sample in the output buffer exceeds 1.0. Cleared by the UI thread.
+    pub clip_l: bool,
+    pub clip_r: bool,
+    /// Internal hold values before exporting to peak_l/peak_r.
+    peak_hold_l: f32,
+    peak_hold_r: f32,
+    /// Multiplicative decay applied per sample (20 dB/s fall time).
+    peak_decay_per_frame: f32,
 }
 
 impl SamplerState {
@@ -133,6 +145,14 @@ impl SamplerState {
             master_volume: 1.0,
             transpose: 0,
             resonance_enabled: true,
+            peak_l: 0.0,
+            peak_r: 0.0,
+            clip_l: false,
+            clip_r: false,
+            peak_hold_l: 0.0,
+            peak_hold_r: 0.0,
+            // 20 dB/s fall: amplitude × 10^(-1/sample_rate) per frame
+            peak_decay_per_frame: (10.0_f32).powf(-1.0 / sample_rate as f32),
         }
     }
 
@@ -214,6 +234,21 @@ impl SamplerState {
                 out_r[i] *= self.master_volume;
             }
         }
+
+        // Update peak meters.
+        let buf_peak_l = out_l[..n_frames].iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        let buf_peak_r = out_r[..n_frames].iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        if buf_peak_l >= 1.0 { self.clip_l = true; }
+        if buf_peak_r >= 1.0 { self.clip_r = true; }
+        let decay = self.peak_decay_per_frame.powi(n_frames as i32);
+        self.peak_hold_l = (self.peak_hold_l * decay).max(buf_peak_l);
+        self.peak_hold_r = (self.peak_hold_r * decay).max(buf_peak_r);
+        // Snap to zero below -96 dB to stop spurious redraws when silent.
+        const SILENCE: f32 = 1.585e-5;
+        if self.peak_hold_l < SILENCE { self.peak_hold_l = 0.0; }
+        if self.peak_hold_r < SILENCE { self.peak_hold_r = 0.0; }
+        self.peak_l = self.peak_hold_l;
+        self.peak_r = self.peak_hold_r;
 
         // Retire finished voices.
         for slot in self.voices.iter_mut() {
@@ -654,6 +689,10 @@ impl SamplerState {
         self.sample_rate
     }
 
+    pub fn active_voice_count(&self) -> usize {
+        self.voices.iter().filter(|s| s.is_some()).count()
+    }
+
     /// Replace the loaded instrument without restarting JACK.
     /// Clears all active voices and resets the sustain pedal and CC/keyswitch state.
     pub fn swap_instrument(
@@ -675,6 +714,12 @@ impl SamplerState {
         self.sw_lokey = sw_lokey;
         self.sw_hikey = sw_hikey;
         self.active_keyswitch = sw_default;
+        self.peak_hold_l = 0.0;
+        self.peak_hold_r = 0.0;
+        self.peak_l = 0.0;
+        self.peak_r = 0.0;
+        self.clip_l = false;
+        self.clip_r = false;
     }
 }
 
