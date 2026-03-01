@@ -43,6 +43,24 @@ samples/
 
 Press **1–9** to switch instruments, **Q** or **Ctrl+C** to quit.
 
+## ODF support
+
+Grand Orgue ODF (`.organ`) files use an INI-style format with `[Organ]` and `[RankNNN]` sections.
+
+| Key | Notes |
+|-----|-------|
+| `NumberOfRanks` | Number of `[RankNNN]` sections to load |
+| `FirstMidiNoteNumber`, `NumberOfLogicalPipes` | MIDI range for the rank |
+| `AmplitudeLevel` | Rank gain as a percentage (100 = unity) |
+| `Gain` | Rank gain in dB, added to `AmplitudeLevel` |
+| `PipeNNN` | Base attack sample filename |
+| `PipeNNNAttackCount`, `PipeNNNAttack001`… | Velocity-layered attack samples |
+| `PipeNNNAttackVelocity` | Velocity threshold for each attack layer |
+| `PipeNNNLoopCount`, `PipeNNNLoop001Start/End` | Loop points for sustain |
+| `PipeNNNReleaseCount`, `PipeNNNRelease001`… | Separate release samples |
+
+`DUMMY` and `REF:` pipe entries are skipped. Backslash path separators are normalised. Missing extensions are tried in order: `.wav`, `.flac`, `.ogg`.
+
 ## SFZ support
 
 The parser handles the opcodes present in the bundled instruments:
