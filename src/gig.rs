@@ -158,11 +158,8 @@ fn decode_wave(d: &[u8], wave_pos: usize) -> Option<WaveInfo> {
 
 // ── Main entry point ──────────────────────────────────────────────────────────
 
-/// Return true if the first region in LIST(lrgn) at [lrgn_cs, lrgn_cs+lrgn_csz)
-/// has a RELEASETRIGGER (0x84) dimension in its 3lnk chunk.
-/// Such instruments interleave attack and release DimRegions at non-trivial
-/// indices; we skip them in favour of the simpler pure attack / pure release
-/// instruments present in the same file.
+/// Return true if the first region in LIST(lrgn) has a RELEASETRIGGER (0x84)
+/// dimension in its 3lnk chunk, indicating a combined attack+release instrument.
 fn has_release_trigger_dim(d: &[u8], lrgn_cs: usize, lrgn_csz: usize) -> bool {
     for (rcid, rds, rsz) in chunks_in(d, lrgn_cs, lrgn_cs + lrgn_csz) {
         if &rcid != b"LIST" || rsz < 4 || &d[rds..rds+4] != b"rgn " { continue; }
@@ -182,11 +179,12 @@ fn has_release_trigger_dim(d: &[u8], lrgn_cs: usize, lrgn_csz: usize) -> bool {
 
 /// Parse a GIG file and return aligned (regions, samples) vectors.
 ///
-/// Only the first pure-attack instrument (no RELEASETRIGGER dimension, name
-/// does not contain "release") and the first pure-release instrument (no
-/// RELEASETRIGGER dimension, name contains "release") are loaded.  Instruments
-/// that combine both via a RELEASETRIGGER dimension are skipped to avoid the
-/// complex interleaved DimRegion index arithmetic they require.
+/// Instrument selection:
+///   - If the file contains a combined instrument (RELEASETRIGGER dimension,
+///     encoding both attack and release within one instrument), the first such
+///     instrument is loaded.  This typically gives more velocity detail than
+///     the separate pure-attack / pure-release instruments in the same file.
+///   - Otherwise the first pure-attack + first pure-release instruments are used.
 ///
 /// The `sample` field of each Region is left empty (PathBuf::new()); the
 /// loaded audio is returned in the parallel `samples` vector.
@@ -209,9 +207,6 @@ pub fn parse_gig(path: &Path) -> Result<(Vec<Region>, Vec<Option<LoadedSample>>)
     let (lins_cs, lins_csz) = find_list(&d, 12, file_end, b"lins")
         .ok_or("no lins chunk")?;
 
-    // ptbl pool offsets are relative to the wvpl data start.
-    // find_list returns children_start = LIST_pos + 12, which is exactly
-    // "wvpl LIST position + 12" as documented in the GIG format.
     let wvpl_data_start = wvpl_cs;
 
     // ── 2. Parse ptbl: cbSize(u32) + n_pool(u32) + n_pool×offset(u32) ─────────
@@ -225,107 +220,112 @@ pub fn parse_gig(path: &Path) -> Result<(Vec<Region>, Vec<Option<LoadedSample>>)
         .map(|i| u32le(&d, ptbl_ds + 8 + i * 4) as usize)
         .collect();
 
-    // ── 3. Iterate instruments ────────────────────────────────────────────────
-    let mut regions: Vec<Region> = Vec::new();
-    let mut samples: Vec<Option<LoadedSample>> = Vec::new();
+    // ── 3a. Classify instruments ──────────────────────────────────────────────
+    struct InstInfo {
+        lrgn_cs:      usize,
+        lrgn_csz:     usize,
+        is_combined:  bool,    // has RELEASETRIGGER dim → encodes attack + release
+        pure_trigger: Trigger, // only meaningful when !is_combined
+    }
 
-    // Pool-offset → decoded WaveInfo (Arc-shared so multiple regions pointing
-    // at the same pool entry pay the decode cost only once).
-    let mut wave_cache: HashMap<usize, Arc<WaveInfo>> = HashMap::new();
-
-    // Only load the first pure attack instrument and the first pure release
-    // instrument.  "Pure" means it has no RELEASETRIGGER dimension; its
-    // dr_idx formula is simply  vel_zone * sc_count  (SC=0 side).
-    let mut attack_loaded  = false;
-    let mut release_loaded = false;
-
+    let mut infos: Vec<InstInfo> = Vec::new();
     for (ins_id, ins_ds, ins_sz) in chunks_in(&d, lins_cs, lins_cs + lins_csz) {
-        if &ins_id != b"LIST" || ins_sz < 4 || &d[ins_ds..ins_ds+4] != b"ins " {
-            continue;
-        }
+        if &ins_id != b"LIST" || ins_sz < 4 || &d[ins_ds..ins_ds+4] != b"ins " { continue; }
         let ins_cs   = ins_ds + 4;
         let ins_cend = ins_ds + ins_sz;
-
         let (lrgn_cs, lrgn_csz) = match find_list(&d, ins_cs, ins_cend, b"lrgn") {
-            Some(x) => x,
-            None    => continue,
+            Some(x) => x, None => continue,
         };
-
-        // Skip instruments that encode both attack and release via a
-        // RELEASETRIGGER dimension.  Their DimRegion index formula is
-        // dr_idx = rel_zone<<rel_shift + vel_zone<<vel_shift and requires
-        // knowing the exact per-slot bit layout; simpler to skip them.
-        if has_release_trigger_dim(&d, lrgn_cs, lrgn_csz) { continue; }
-
-        // Determine trigger type from the instrument name.
-        let inst_trigger = match read_inam(&d, ins_cs, ins_sz.saturating_sub(4)) {
-            Some(ref n) if n.to_lowercase().contains("release") => Trigger::Release,
-            _ => Trigger::Attack,
-        };
-
-        // Take at most one attack instrument and one release instrument.
-        match inst_trigger {
-            Trigger::Attack  if  attack_loaded => continue,
-            Trigger::Release if release_loaded => continue,
-            _ => {}
-        }
-        match inst_trigger {
-            Trigger::Attack  => attack_loaded  = true,
-            Trigger::Release => release_loaded = true,
-        }
-
-        // ── Iterate LIST(rgn) ─────────────────────────────────────────────────
-        for (rgn_id, rgn_ds, rgn_sz) in chunks_in(&d, lrgn_cs, lrgn_cs + lrgn_csz) {
-            if &rgn_id != b"LIST" || rgn_sz < 4 || &d[rgn_ds..rgn_ds+4] != b"rgn " {
-                continue;
+        let is_combined = has_release_trigger_dim(&d, lrgn_cs, lrgn_csz);
+        let pure_trigger = if is_combined {
+            Trigger::Attack // placeholder — not used for combined instruments
+        } else {
+            match read_inam(&d, ins_cs, ins_sz.saturating_sub(4)) {
+                Some(ref n) if n.to_lowercase().contains("release") => Trigger::Release,
+                _ => Trigger::Attack,
             }
+        };
+        infos.push(InstInfo { lrgn_cs, lrgn_csz, is_combined, pure_trigger });
+    }
+
+    // ── 3b. Select instruments to parse ───────────────────────────────────────
+    // Prefer the first combined instrument (provides matching attack + release
+    // velocity layers, typically 8 each vs only 4 in the separate release inst).
+    // Fall back to first pure-attack + first pure-release if none exists.
+    let selected: Vec<usize> = {
+        if let Some(i) = infos.iter().position(|x| x.is_combined) {
+            vec![i]
+        } else {
+            let mut v = Vec::new();
+            if let Some(i) = infos.iter().position(|x| !x.is_combined && x.pure_trigger == Trigger::Attack) {
+                v.push(i);
+            }
+            if let Some(i) = infos.iter().position(|x| !x.is_combined && x.pure_trigger == Trigger::Release) {
+                v.push(i);
+            }
+            v
+        }
+    };
+
+    // ── 3c. Parse selected instruments ────────────────────────────────────────
+    let mut regions: Vec<Region> = Vec::new();
+    let mut samples: Vec<Option<LoadedSample>> = Vec::new();
+    let mut wave_cache: HashMap<usize, Arc<WaveInfo>> = HashMap::new();
+
+    for &inst_idx in &selected {
+        let inst = &infos[inst_idx];
+
+        for (rgn_id, rgn_ds, rgn_sz) in chunks_in(&d, inst.lrgn_cs, inst.lrgn_cs + inst.lrgn_csz) {
+            if &rgn_id != b"LIST" || rgn_sz < 4 || &d[rgn_ds..rgn_ds+4] != b"rgn " { continue; }
             let rgn_cs   = rgn_ds + 4;
             let rgn_cend = rgn_ds + rgn_sz;
 
-            // rgnh: KeyRange.lo(u16) KeyRange.hi(u16) VelRange.lo(u16) VelRange.hi(u16) ...
+            // rgnh: KeyRange.lo(u16) KeyRange.hi(u16) ...
             let (rgnh_ds, rgnh_sz) = match find_chunk(&d, rgn_cs, rgn_cend, b"rgnh") {
-                Some(x) => x,
-                None    => continue,
+                Some(x) => x, None => continue,
             };
             if rgnh_sz < 8 { continue; }
             let key_lo = u16le(&d, rgnh_ds)     as u8;
             let key_hi = u16le(&d, rgnh_ds + 2) as u8;
 
-            // 3lnk (172 bytes):
-            //   DimCount(u32) + 5×DimDef(8 bytes) + 32×WPI(u32)
-            //   DimDef: {type u8, bits u8, zones u8, split_type u8, zone_size f32}
-            //   WPI[i] = pool index for DimRegion i (0xFFFF_FFFF = no sample)
-            //   WPI starts at byte offset 44 from 3lnk data start.
+            // 3lnk: DimCount(u32) + 5×DimDef(8B) + 32×WPI(u32).
+            // WPI starts at byte offset 44 from 3lnk data start.
             let (lnk_ds, lnk_sz) = match find_chunk(&d, rgn_cs, rgn_cend, b"3lnk") {
-                Some(x) => x,
-                None    => continue,
+                Some(x) => x, None => continue,
             };
             if lnk_sz < 172 { continue; }
 
             let dim_count = u32le(&d, lnk_ds) as usize;
             if dim_count == 0 || dim_count > 32 { continue; }
 
-            // Parse dimension definitions (5 slots starting at offset 4).
-            let mut sc_bits:  u32 = 0; // SAMPLECHANNEL (0x80)
-            let mut vel_bits: u32 = 0; // VELOCITY      (0x82)
+            // Parse dimension bit-shifts.
+            // Each slot contributes `bits` bits to the DimRegion index starting
+            // at `cumulative`.  The dr_idx for (sc=0, rel=r, vel=v) is:
+            //   r << rel_shift  |  v << vel_shift
+            let mut cumulative: u32 = 0;
+            let mut vel_shift:  u32 = 0;
+            let mut vel_bits:   u32 = 0;
+            let mut rel_shift:  u32 = 0;
             for slot in 0..5usize {
-                let off = lnk_ds + 4 + slot * 8;
-                let bits = d[off + 1];
+                let off      = lnk_ds + 4 + slot * 8;
+                let dim_type = d[off];
+                let bits     = d[off + 1] as u32;
                 if bits == 0 { continue; }
-                match d[off] {
-                    0x80 => sc_bits  = bits as u32,
-                    0x82 => vel_bits = bits as u32,
-                    _ => {}
+                match dim_type {
+                    0x84 => rel_shift = cumulative, // RELEASETRIGGER
+                    0x82 => { vel_shift = cumulative; vel_bits = bits; } // VELOCITY
+                    _ => {} // SAMPLECHANNEL and others consume bits but need no special handling
                 }
+                cumulative += bits;
             }
 
             let vel_zones = if vel_bits > 0 { 1usize << vel_bits } else { 1 };
-            let sc_count  = if sc_bits  > 0 { 1usize << sc_bits  } else { 1 };
-            let wpi_base  = lnk_ds + 44; // WPI table base
+            // For combined instruments iterate rel=0 (attack) then rel=1 (release).
+            // For pure instruments rel_count=1 and rel_shift=0, so dr_base stays 0.
+            let rel_count = if inst.is_combined { 2usize } else { 1 };
+            let wpi_base  = lnk_ds + 44;
 
-            // Collect per-DimRegion VelocityUpperLimit from
-            // LIST(3prg) → LIST(3ewl) → 3ewa chunks (in DimRegion index order).
-            // VelocityUpperLimit is a u8 at byte offset +124 inside each 3ewa chunk.
+            // Collect VelocityUpperLimit for every DimRegion from 3ewa[dr_idx][+124].
             let mut vel_upper: Vec<u8> = vec![127u8; dim_count];
             if let Some((p3_cs, p3_csz)) = find_list(&d, rgn_cs, rgn_cend, b"3prg") {
                 if let Some((ewl_cs, ewl_csz)) = find_list(&d, p3_cs, p3_cs + p3_csz, b"3ewl") {
@@ -342,30 +342,38 @@ pub fn parse_gig(path: &Path) -> Result<(Vec<Region>, Vec<Option<LoadedSample>>)
                 }
             }
 
-            // ── One Region per velocity zone (SC=0 / left-channel side) ──────
-            let mut prev_vel_hi: u8 = 0;
-            for vel_zone in 0..vel_zones {
-                let dr_idx = vel_zone * sc_count; // SC=0 → lowest SC bit = 0
+            // ── One Region per (rel_zone, vel_zone) — SC=0 side only ──────────
+            for rel_zone in 0..rel_count {
+                let trigger = if inst.is_combined {
+                    if rel_zone == 0 { Trigger::Attack } else { Trigger::Release }
+                } else {
+                    inst.pure_trigger.clone()
+                };
 
-                if dr_idx >= 32 { break; }
-                let wpi_off = wpi_base + dr_idx * 4;
-                if wpi_off + 4 > d.len() { break; }
+                let dr_base = rel_zone << rel_shift;
+                let mut prev_vel_hi: u8 = 0;
 
-                let pool_idx_raw = u32le(&d, wpi_off);
-                if pool_idx_raw == 0xFFFF_FFFF { continue; } // no sample assigned
-                let pool_idx = pool_idx_raw as usize;
-                if pool_idx >= pool_table.len() { continue; }
+                for vel_zone in 0..vel_zones {
+                    // SC=0: bit 0 of dr_idx is 0, so sc contributes nothing.
+                    let dr_idx = dr_base + (vel_zone << vel_shift);
 
-                let pool_offset = pool_table[pool_idx];
+                    if dr_idx >= 32 { break; }
+                    let wpi_off = wpi_base + dr_idx * 4;
+                    if wpi_off + 4 > d.len() { break; }
 
-                let vel_hi = if dr_idx < dim_count { vel_upper[dr_idx] } else { 127 };
-                let vel_lo = if vel_zone == 0 { 0u8 } else { prev_vel_hi.saturating_add(1) };
-                prev_vel_hi = vel_hi;
+                    let pool_idx_raw = u32le(&d, wpi_off);
+                    if pool_idx_raw == 0xFFFF_FFFF { continue; }
+                    let pool_idx = pool_idx_raw as usize;
+                    if pool_idx >= pool_table.len() { continue; }
 
-                // Decode (or reuse cached) wave from the pool.
-                let wi = wave_cache.entry(pool_offset)
-                    .or_insert_with(|| {
-                        Arc::new(
+                    let pool_offset = pool_table[pool_idx];
+
+                    let vel_hi = if dr_idx < dim_count { vel_upper[dr_idx] } else { 127 };
+                    let vel_lo = if vel_zone == 0 { 0u8 } else { prev_vel_hi.saturating_add(1) };
+                    prev_vel_hi = vel_hi;
+
+                    let wi = wave_cache.entry(pool_offset)
+                        .or_insert_with(|| Arc::new(
                             decode_wave(&d, wvpl_data_start + pool_offset)
                                 .unwrap_or(WaveInfo {
                                     pcm: Arc::new(Vec::new()),
@@ -373,32 +381,30 @@ pub fn parse_gig(path: &Path) -> Result<(Vec<Region>, Vec<Option<LoadedSample>>)
                                     loop_start: None,
                                     loop_end: None,
                                 })
-                        )
+                        ));
+
+                    samples.push(Some(LoadedSample {
+                        data: Arc::clone(&wi.pcm),
+                        frames: wi.frames,
+                        loop_start: wi.loop_start,
+                        loop_end: wi.loop_end,
+                    }));
+
+                    regions.push(Region {
+                        lokey: key_lo,
+                        hikey: key_hi,
+                        lovel: vel_lo,
+                        hivel: vel_hi,
+                        pitch_keycenter: key_lo,
+                        trigger: trigger.clone(),
+                        amp_veltrack: 100.0,
+                        ampeg_release: match trigger {
+                            Trigger::Attack  => 0.5,
+                            Trigger::Release => 0.0,
+                        },
+                        ..Region::default()
                     });
-
-                samples.push(Some(LoadedSample {
-                    data: Arc::clone(&wi.pcm),
-                    frames: wi.frames,
-                    loop_start: wi.loop_start,
-                    loop_end: wi.loop_end,
-                }));
-
-                regions.push(Region {
-                    lokey: key_lo,
-                    hikey: key_hi,
-                    lovel: vel_lo,
-                    hivel: vel_hi,
-                    // Each region covers its own key; pitch_keycenter = key_lo
-                    // so the sample plays at 1× speed for exactly that key.
-                    pitch_keycenter: key_lo,
-                    trigger: inst_trigger.clone(),
-                    amp_veltrack: 100.0,
-                    ampeg_release: match inst_trigger {
-                        Trigger::Attack  => 0.5,
-                        Trigger::Release => 0.0,
-                    },
-                    ..Region::default()
-                });
+                }
             }
         }
     }

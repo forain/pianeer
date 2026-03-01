@@ -93,15 +93,15 @@ Grand Orgue ODF (`.organ`) files use an INI-style format with `[Organ]` and `[Ra
 
 GIG (`.gig`) is a RIFF/DLS Level 2 container with embedded 16-bit PCM audio, used by GigaSampler and LinuxSampler. Samples are decoded in-memory at load time; regions sharing the same pool entry share the PCM buffer via reference counting.
 
-The first pure-attack instrument (no `RELEASETRIGGER` dimension, name does not contain "release") and the first pure-release instrument (no `RELEASETRIGGER` dimension, name contains "release") in the file are loaded. Instruments that encode both attack and release via a `RELEASETRIGGER` dimension are skipped because the same file already provides equivalent separate instruments, and loading both would stack redundant voice layers.
+Instrument selection prefers the first combined instrument (one that encodes both attack and release via a `RELEASETRIGGER` (0x84) dimension). This typically provides more velocity layers for both attack and release than the separate pure-attack/pure-release instruments in the same file. If no combined instrument exists, the first pure-attack and first pure-release instruments are loaded instead.
 
 | Concept | Notes |
 |---------|-------|
 | Wave pool (`ptbl` + `wvpl`) | Up to 32-bit pool index table; offsets relative to `wvpl` data start |
-| Dimension regions (`3lnk`) | `SAMPLECHANNEL` (0x80) and `VELOCITY` (0x82) dimensions; left-channel (SC=0) side only |
+| Dimension regions (`3lnk`) | `SAMPLECHANNEL` (0x80), `VELOCITY` (0x82), and `RELEASETRIGGER` (0x84) dimensions; left-channel (SC=0) side only |
 | Velocity ranges | `VelocityUpperLimit` read from `3ewa` chunk at byte offset +124, one per DimRegion |
 | Loop points | Read from wave-level `wsmp` chunk: `LoopStart` / `LoopStart + LoopLength` (exclusive end) |
-| Trigger detection | Instrument name containing "release" → `Trigger::Release`; otherwise `Trigger::Attack` |
+| Trigger detection | Combined instrument: `RELEASETRIGGER` dim-zone 0 → `Attack`, zone 1 → `Release`. Pure instrument: name containing "release" → `Trigger::Release`; otherwise `Trigger::Attack` |
 | Pitch | `pitch_keycenter = key_range.low` (one sample per key, plays at 1× speed on its mapped key) |
 
 ## Kontakt 2 support
