@@ -93,7 +93,7 @@ Grand Orgue ODF (`.organ`) files use an INI-style format with `[Organ]` and `[Ra
 
 GIG (`.gig`) is a RIFF/DLS Level 2 container with embedded 16-bit PCM audio, used by GigaSampler and LinuxSampler. Samples are decoded in-memory at load time; regions sharing the same pool entry share the PCM buffer via reference counting.
 
-Instruments with a `RELEASETRIGGER` dimension (combined attack+release in one instrument) are skipped. The first pure-attack instrument and the first pure-release instrument in the file are loaded.
+The first pure-attack instrument (no `RELEASETRIGGER` dimension, name does not contain "release") and the first pure-release instrument (no `RELEASETRIGGER` dimension, name contains "release") in the file are loaded. Instruments that encode both attack and release via a `RELEASETRIGGER` dimension are skipped because the same file already provides equivalent separate instruments, and loading both would stack redundant voice layers.
 
 | Concept | Notes |
 |---------|-------|
