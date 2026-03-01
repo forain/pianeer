@@ -4,9 +4,10 @@ mod organ;
 mod sampler;
 mod midi;
 mod instruments;
+mod midi_player;
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -20,6 +21,42 @@ use jack::{AudioOut, Client, ClientOptions, Control, NotificationHandler, Proces
 use instruments::Instrument;
 use region::Region;
 use sampler::{LoadedSample, MidiEvent, SamplerState};
+
+// ─── Menu items ───────────────────────────────────────────────────────────────
+
+enum MenuItem {
+    Instrument(Instrument),
+    MidiFile { name: String, path: PathBuf },
+}
+
+impl MenuItem {
+    fn display_name(&self) -> &str {
+        match self {
+            MenuItem::Instrument(i) => &i.name,
+            MenuItem::MidiFile { name, .. } => name,
+        }
+    }
+}
+
+struct PlaybackState {
+    stop: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    _handle: thread::JoinHandle<()>,
+    menu_idx: usize,
+}
+
+fn stop_playback(pb: &mut Option<PlaybackState>) {
+    if let Some(p) = pb.take() {
+        p.stop.store(true, Ordering::Relaxed);
+        // Thread is detached; it sends AllNotesOff before exiting.
+    }
+}
+
+fn playing_idx(pb: &Option<PlaybackState>) -> Option<usize> {
+    pb.as_ref()
+        .filter(|p| !p.done.load(Ordering::Relaxed))
+        .map(|p| p.menu_idx)
+}
 
 // ─── JACK process handler ────────────────────────────────────────────────────
 
@@ -243,16 +280,27 @@ fn load_instrument_data(inst: &Instrument) -> Result<(Vec<Region>, Vec<Option<Lo
 
 // ─── Menu display ─────────────────────────────────────────────────────────────
 
-fn print_menu(instruments: &[Instrument], current: usize) {
-    // Clear screen and home cursor, then draw menu with raw-mode line endings.
+fn print_menu(menu: &[MenuItem], current: usize, playing: Option<usize>) {
     print!("\x1b[2J\x1b[H");
-    print!("Instruments (press number to switch, Q / Ctrl+C to quit):\r\n");
-    for (i, inst) in instruments.iter().enumerate() {
-        if i == current {
-            print!(" *{}. {}\r\n", i + 1, inst.name);
-        } else {
-            print!("  {}. {}\r\n", i + 1, inst.name);
+    print!("Pianeer — press 1-9 to load instrument or play MIDI file, Q/Ctrl+C to quit:\r\n");
+
+    let has_midi = menu.iter().any(|m| matches!(m, MenuItem::MidiFile { .. }));
+    let mut in_midi = false;
+
+    for (i, item) in menu.iter().enumerate() {
+        if has_midi && !in_midi && matches!(item, MenuItem::Instrument(_)) && i == 0 {
+            print!("\r\nInstruments:\r\n");
         }
+        if !in_midi && matches!(item, MenuItem::MidiFile { .. }) {
+            print!("\r\nMIDI files:\r\n");
+            in_midi = true;
+        }
+
+        let is_current = matches!(item, MenuItem::Instrument(_)) && i == current;
+        let is_playing = playing == Some(i);
+        let marker = if is_current { '*' } else if is_playing { '>' } else { ' ' };
+        let tag = if is_playing { " [playing]" } else { "" };
+        print!("  {}{}: {}{}\r\n", marker, i + 1, item.display_name(), tag);
     }
     std::io::stdout().flush().ok();
 }
@@ -273,14 +321,28 @@ fn main() {
     println!("Scanning instruments in {}...", samples_dir.display());
 
     // 2. Discover instruments.
-    let instruments = instruments::discover(&samples_dir);
-    if instruments.is_empty() {
+    let raw_instruments = instruments::discover(&samples_dir);
+    if raw_instruments.is_empty() {
         eprintln!("Error: no .sfz or .organ files found under {}", samples_dir.display());
         std::process::exit(1);
     }
 
-    // 3. Load first instrument.
-    let (regions, samples) = match load_instrument_data(&instruments[0]) {
+    // 3. Discover MIDI files and build unified menu (instruments first, then MIDI files, ≤9).
+    let midi_files = match midi_player::find_midi_dir() {
+        Some(dir) => midi_player::discover(&dir),
+        None => Vec::new(),
+    };
+    let mut menu: Vec<MenuItem> = raw_instruments.into_iter().map(MenuItem::Instrument).collect();
+    let remaining = 9usize.saturating_sub(menu.len());
+    for (name, path) in midi_files.into_iter().take(remaining) {
+        menu.push(MenuItem::MidiFile { name, path });
+    }
+
+    // 4. Load first instrument.
+    let first_inst = menu.iter().find_map(|m| {
+        if let MenuItem::Instrument(i) = m { Some(i) } else { None }
+    }).unwrap(); // guaranteed: raw_instruments was non-empty
+    let (regions, samples) = match load_instrument_data(first_inst) {
         Ok(data) => data,
         Err(e) => { eprintln!("{}", e); std::process::exit(1); }
     };
@@ -399,7 +461,7 @@ fn main() {
 
     // 13. Enable raw mode and show menu.
     terminal::enable_raw_mode().expect("Failed to enable raw mode");
-    print_menu(&instruments, 0);
+    print_menu(&menu, 0, None);
 
     // 14. Set up quit flag and switch channel.
     let quit = Arc::new(AtomicBool::new(false));
@@ -438,39 +500,67 @@ fn main() {
         }
     });
 
-    // 16. Main loop: handle quit and instrument switches.
-    let mut current = 0usize;
+    // 16. Main loop: handle quit, instrument switches, and MIDI file playback.
+    let mut current = 0usize; // index in `menu` of the loaded instrument
+    let mut playback: Option<PlaybackState> = None;
     loop {
         thread::sleep(Duration::from_millis(100));
 
         if quit.load(Ordering::Relaxed) {
+            stop_playback(&mut playback);
             terminal::disable_raw_mode().ok();
             println!("\r\nExiting...");
             break;
         }
 
+        // Redraw if MIDI playback ended naturally.
+        if let Some(ref p) = playback {
+            if p.done.load(Ordering::Relaxed) {
+                playback = None;
+                print_menu(&menu, current, None);
+            }
+        }
+
         if let Ok(idx) = switch_rx.try_recv() {
-            if idx < instruments.len() && idx != current {
-                // Drain any additional queued switch events.
-                while switch_rx.try_recv().is_ok() {}
-
-                terminal::disable_raw_mode().ok();
-                println!("\r\nLoading {}...", instruments[idx].name);
-
-                match load_instrument_data(&instruments[idx]) {
-                    Ok((regions, samples)) => {
-                        if let Ok(ref mut s) = state.lock() {
-                            s.swap_instrument(regions, samples);
+            if idx >= menu.len() { continue; }
+            match &menu[idx] {
+                MenuItem::Instrument(inst) if idx != current => {
+                    // Drain rapid key repeats; keep MIDI playing across instrument switches.
+                    while switch_rx.try_recv().is_ok() {}
+                    terminal::disable_raw_mode().ok();
+                    println!("\r\nLoading {}...", inst.name);
+                    match load_instrument_data(inst) {
+                        Ok((regions, samples)) => {
+                            if let Ok(ref mut s) = state.lock() {
+                                s.swap_instrument(regions, samples);
+                            }
+                            current = idx;
                         }
-                        current = idx;
+                        Err(e) => eprintln!("Error loading instrument: {}", e),
                     }
-                    Err(e) => {
-                        eprintln!("Error loading instrument: {}", e);
-                    }
+                    terminal::enable_raw_mode().ok();
+                    print_menu(&menu, current, playing_idx(&playback));
                 }
-
-                terminal::enable_raw_mode().ok();
-                print_menu(&instruments, current);
+                MenuItem::MidiFile { path, .. } => {
+                    let path = path.clone();
+                    let already_playing = playback.as_ref()
+                        .map_or(false, |p| p.menu_idx == idx && !p.done.load(Ordering::Relaxed));
+                    stop_playback(&mut playback);
+                    if !already_playing {
+                        let stop_flag = Arc::new(AtomicBool::new(false));
+                        let done_flag = Arc::new(AtomicBool::new(false));
+                        let handle = midi_player::spawn(
+                            path, midi_tx.clone(),
+                            Arc::clone(&stop_flag), Arc::clone(&done_flag),
+                        );
+                        playback = Some(PlaybackState {
+                            stop: stop_flag, done: done_flag,
+                            _handle: handle, menu_idx: idx,
+                        });
+                    }
+                    print_menu(&menu, current, playing_idx(&playback));
+                }
+                _ => {} // same instrument re-selected, ignore
             }
         }
     }
