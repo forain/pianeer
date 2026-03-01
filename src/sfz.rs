@@ -34,8 +34,10 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<Vec<Region>, String> {
     let base_dir = sfz_path.parent().unwrap_or(Path::new("."));
 
     let mut regions = Vec::new();
+    let mut global = GroupState::default();
     let mut group = GroupState::default();
     let mut in_region = false;
+    let mut in_global = false;
     let mut current_region = Region::default();
 
     for line in content.lines() {
@@ -74,13 +76,33 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<Vec<Region>, String> {
             if token.starts_with('<') && token.ends_with('>') {
                 let header = &token[1..token.len() - 1];
                 match header {
+                    "global" => {
+                        if in_region {
+                            regions.push(current_region.clone());
+                            in_region = false;
+                        }
+                        global = GroupState::default();
+                        in_global = true;
+                    }
+                    // <master> sits between <global> and <group> in the SFZ v2
+                    // hierarchy. Inherit from global; group will inherit from it.
+                    "master" => {
+                        if in_region {
+                            regions.push(current_region.clone());
+                            in_region = false;
+                        }
+                        group = global.clone();
+                        in_global = false;
+                    }
                     "group" => {
                         if in_region {
                             regions.push(current_region.clone());
                             in_region = false;
                         }
-                        group = GroupState::default();
+                        // Inherit global defaults; group-level opcodes will override.
+                        group = global.clone();
                         current_region = Region::default();
+                        in_global = false;
                     }
                     "region" => {
                         if in_region {
@@ -88,6 +110,11 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<Vec<Region>, String> {
                         }
                         current_region = region_from_group(&group);
                         in_region = true;
+                        in_global = false;
+                    }
+                    // <control> contains set_cc / label_cc — no audio impact, skip.
+                    "control" => {
+                        in_global = false;
                     }
                     _ => {}
                 }
@@ -97,6 +124,8 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<Vec<Region>, String> {
 
                 if in_region {
                     apply_opcode_to_region(&mut current_region, key, val, base_dir);
+                } else if in_global {
+                    apply_opcode_to_group(&mut global, key, val);
                 } else {
                     apply_opcode_to_group(&mut group, key, val);
                 }
