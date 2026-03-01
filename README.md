@@ -1,6 +1,6 @@
 # pianeer
 
-A low-latency JACK audio sampler for keyboard instruments. Plays SFZ, Grand Orgue ODF, and Kontakt 2 instruments in response to MIDI input.
+A low-latency JACK audio sampler for keyboard instruments. Plays SFZ, Grand Orgue ODF, Kontakt 2, and GIG instruments in response to MIDI input.
 
 ## Features
 
@@ -8,6 +8,7 @@ A low-latency JACK audio sampler for keyboard instruments. Plays SFZ, Grand Orgu
 - SFZ v2/ARIA format support with full `<global>` → `<master>` → `<group>` → `<region>` inheritance
 - Grand Orgue ODF format support (`.organ` files)
 - Kontakt 2 format support (`.nki` / `.nkm` files)
+- GIG format support (`.gig` files — RIFF/DLS with embedded PCM)
 - In-app instrument menu — press 1–9 to switch instruments live, R to rescan
 - MIDI file playback (press 1–9 on a `.mid` file)
 - Parallel sample loading
@@ -42,8 +43,10 @@ samples/
 │   └── instrument.sfz
 ├── My Organ/
 │   └── instrument.organ
-└── My Harpsichord/
-    └── instrument.nki
+├── My Harpsichord/
+│   └── instrument.nki
+└── My GIG Piano/
+    └── instrument.gig
 ```
 
 Press **1–9** to load an instrument or play a MIDI file, **R** to rescan the samples directory, **Q** or **Ctrl+C** to quit.
@@ -86,6 +89,21 @@ Grand Orgue ODF (`.organ`) files use an INI-style format with `[Organ]` and `[Ra
 
 `DUMMY` and `REF:` pipe entries are skipped.
 
+## GIG support
+
+GIG (`.gig`) is a RIFF/DLS Level 2 container with embedded 16-bit PCM audio, used by GigaSampler and LinuxSampler. Samples are decoded in-memory at load time; regions sharing the same pool entry share the PCM buffer via reference counting.
+
+Instruments with a `RELEASETRIGGER` dimension (combined attack+release in one instrument) are skipped. The first pure-attack instrument and the first pure-release instrument in the file are loaded.
+
+| Concept | Notes |
+|---------|-------|
+| Wave pool (`ptbl` + `wvpl`) | Up to 32-bit pool index table; offsets relative to `wvpl` data start |
+| Dimension regions (`3lnk`) | `SAMPLECHANNEL` (0x80) and `VELOCITY` (0x82) dimensions; left-channel (SC=0) side only |
+| Velocity ranges | `VelocityUpperLimit` read from `3ewa` chunk at byte offset +124, one per DimRegion |
+| Loop points | Read from wave-level `wsmp` chunk: `LoopStart` / `LoopStart + LoopLength` (exclusive end) |
+| Trigger detection | Instrument name containing "release" → `Trigger::Release`; otherwise `Trigger::Attack` |
+| Pitch | `pitch_keycenter = key_range.low` (one sample per key, plays at 1× speed on its mapped key) |
+
 ## Kontakt 2 support
 
 Reads `.nki` (single program) and `.nkm` (multi-program bank) files. The binary format contains a zlib-compressed XML payload. `.nkm` files are suppressed in the menu when `.nki` files are present in the same directory.
@@ -115,4 +133,5 @@ Reads `.nki` (single program) and `.nkm` (multi-program bank) files. The binary 
 | `src/sfz.rs` | SFZ parser with `#include`/`#define` expansion |
 | `src/organ.rs` | Grand Orgue ODF parser |
 | `src/kontakt.rs` | Kontakt 2 NKI/NKM parser |
+| `src/gig.rs` | GIG/DLS binary parser |
 | `src/region.rs` | Shared `Region` type |
