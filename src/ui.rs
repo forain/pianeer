@@ -64,11 +64,14 @@ pub fn print_menu(menu: &[MenuItem], cursor: usize, loaded: usize, playing: Opti
 
         let is_loaded = matches!(item, MenuItem::Instrument(_)) && i == loaded;
         let is_playing = playing == Some(i);
-        let arrow = if i == cursor { ">" } else { " " };
-        let mut tags = String::new();
-        if is_loaded { tags.push_str(" [loaded]"); }
-        if is_playing { tags.push_str(" [playing]"); }
-        print!("  {} {}{}\r\n", arrow, item.display_name(), tags);
+        // Fixed-width tag column (9 chars) keeps titles aligned.
+        let tag = if is_playing { "[playing]" } else if is_loaded { "[loaded] " } else { "         " };
+        let title = item.display_name();
+        if i == cursor {
+            print!("  {}  \x1b[7m{}\x1b[27m\r\n", tag, title);
+        } else {
+            print!("  {}  {}\r\n", tag, title);
+        }
     }
     std::io::stdout().flush().ok();
 }
