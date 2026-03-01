@@ -32,9 +32,6 @@ const MAX_VOICES: usize = 128;
 /// Amplitude below which a releasing voice is considered silent (linear).
 /// Corresponds to -96 dB: 10^(-96/20) ≈ 1.585e-5
 const SILENCE_AMPLITUDE: f32 = 1.585e-5;
-/// Keep-alive tone amplitude (-40 dBFS). A 20 Hz AC sine passes output
-/// coupling capacitors and prevents codec auto-mute between notes.
-const KEEP_ALIVE_AMP: f32 = 0.01;
 
 #[derive(Clone)]
 enum EnvelopeState {
@@ -66,6 +63,12 @@ struct Voice {
     /// Precomputed release decay per sample.
     decay_per_sample: f32,
     is_release_trigger: bool,
+    /// Frame index when this voice was spawned (for rt_decay and voice stealing).
+    started_at: u64,
+    /// Equal-power pan gain for left channel.
+    pan_l: f32,
+    /// Equal-power pan gain for right channel.
+    pan_r: f32,
 }
 
 pub struct SamplerState {
@@ -75,7 +78,8 @@ pub struct SamplerState {
     sustain_pedal: bool,
     sample_rate: f64,
     midi_rx: Receiver<MidiEvent>,
-    keep_alive_phase: f64,
+    /// Cumulative frame counter, incremented at the start of each process() call.
+    frame_count: u64,
 }
 
 impl SamplerState {
@@ -92,13 +96,14 @@ impl SamplerState {
             sustain_pedal: false,
             sample_rate,
             midi_rx,
-            keep_alive_phase: 0.0,
+            frame_count: 0,
         }
     }
 
     /// Process one JACK buffer. Write to out_l and out_r slices.
     pub fn process(&mut self, out_l: &mut [f32], out_r: &mut [f32]) {
         let n_frames = out_l.len();
+        self.frame_count += n_frames as u64;
 
         for i in 0..n_frames {
             out_l[i] = 0.0;
@@ -139,15 +144,13 @@ impl SamplerState {
                             break;
                         }
 
-                        let (l0, r0) = (data[pos_floor * 2], data[pos_floor * 2 + 1]);
-                        let (l1, r1) = if pos_floor + 1 < total_frames {
-                            (data[(pos_floor + 1) * 2], data[(pos_floor + 1) * 2 + 1])
-                        } else {
-                            (l0, r0)
-                        };
-
-                        let l = l0 + (l1 - l0) * frac;
-                        let r = r0 + (r1 - r0) * frac;
+                        // Hermite cubic interpolation using 4 surrounding frames.
+                        let (l_1, r_1) = sample_at(data, total_frames, pos_floor.saturating_sub(1));
+                        let (l0, r0) = sample_at(data, total_frames, pos_floor);
+                        let (l1, r1) = sample_at(data, total_frames, pos_floor + 1);
+                        let (l2, r2) = sample_at(data, total_frames, pos_floor + 2);
+                        let l = hermite(l_1, l0, l1, l2, frac);
+                        let r = hermite(r_1, r0, r1, r2, frac);
 
                         let env_amp = match &mut voice.envelope {
                             EnvelopeState::Sustaining => 1.0f32,
@@ -159,24 +162,12 @@ impl SamplerState {
                         };
 
                         let gain = voice.amplitude * env_amp;
-                        out_l[frame] += l * gain;
-                        out_r[frame] += r * gain;
+                        out_l[frame] += l * gain * voice.pan_l;
+                        out_r[frame] += r * gain * voice.pan_r;
 
                         voice.position += voice.playback_rate;
                     }
                 }
-            }
-        }
-
-        // Keep-alive: 20 Hz sine at -40 dBFS.
-        let phase_step = 20.0 / self.sample_rate;
-        for i in 0..n_frames {
-            let ka = (self.keep_alive_phase * std::f64::consts::TAU).sin() as f32 * KEEP_ALIVE_AMP;
-            out_l[i] += ka;
-            out_r[i] += ka;
-            self.keep_alive_phase += phase_step;
-            if self.keep_alive_phase >= 1.0 {
-                self.keep_alive_phase -= 1.0;
             }
         }
 
@@ -277,6 +268,16 @@ impl SamplerState {
     }
 
     fn note_off(&mut self, note: u8) {
+        // Compute how long the note was held (for rt_decay on release voices).
+        let held_frames = self.voices.iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|v| v.note == note && !v.is_release_trigger
+                && matches!(v.envelope, EnvelopeState::Sustaining))
+            .map(|v| self.frame_count.saturating_sub(v.started_at))
+            .max()
+            .unwrap_or(0);
+        let held_secs = held_frames as f32 / self.sample_rate as f32;
+
         for slot in self.voices.iter_mut() {
             if let Some(ref mut v) = slot {
                 if v.note == note && !v.is_release_trigger {
@@ -311,7 +312,7 @@ impl SamplerState {
             release_regions.push(idx);
         }
         for region_idx in release_regions {
-            self.spawn_release_voice(region_idx, note, 64);
+            self.spawn_release_voice(region_idx, note, 64, held_secs);
         }
     }
 
@@ -408,38 +409,46 @@ impl SamplerState {
     }
 
     fn find_free_voice(&mut self) -> usize {
+        let fc = self.frame_count;
+        let mut best_idx = 0;
+        let mut best_score = u64::MAX;
+
         for (i, slot) in self.voices.iter().enumerate() {
-            if slot.is_none() { return i; }
-        }
-        for (i, slot) in self.voices.iter().enumerate() {
-            if let Some(ref v) = slot {
-                if v.is_release_trigger && matches!(v.envelope, EnvelopeState::Releasing { .. }) {
-                    return i;
-                }
+            if slot.is_none() {
+                return i;
+            }
+            let v = slot.as_ref().unwrap();
+            let age = fc.saturating_sub(v.started_at);
+            let score: u64 = match (&v.envelope, v.is_release_trigger) {
+                (EnvelopeState::Releasing { amplitude, .. }, true) =>
+                    (*amplitude * 1000.0) as u64,
+                (EnvelopeState::Releasing { amplitude, .. }, false) =>
+                    1_000_000 + (*amplitude * 1000.0) as u64,
+                (EnvelopeState::Sustaining, true) =>
+                    2_000_000u64.saturating_sub(age),
+                (EnvelopeState::Sustaining, false) =>
+                    3_000_000u64.saturating_sub(age),
+            };
+            if score < best_score {
+                best_score = score;
+                best_idx = i;
             }
         }
-        for (i, slot) in self.voices.iter().enumerate() {
-            if let Some(ref v) = slot {
-                if matches!(v.envelope, EnvelopeState::Releasing { .. }) { return i; }
-            }
-        }
-        for (i, slot) in self.voices.iter().enumerate() {
-            if let Some(ref v) = slot {
-                if v.is_release_trigger { return i; }
-            }
-        }
-        0
+        best_idx
     }
 
     fn spawn_voice(&mut self, region_idx: usize, note: u8, velocity: u8, is_release_trigger: bool) {
-        let (playback_rate, amplitude, release_time, group, off_by) = {
+        let (playback_rate, amplitude, release_time, group, off_by, pan_l, pan_r) = {
             let region = &self.regions[region_idx];
+            let angle = std::f32::consts::FRAC_PI_4 * (region.pan / 100.0 + 1.0);
             (
                 compute_playback_rate(note, region),
                 compute_amplitude(velocity, region),
                 region.ampeg_release.max(0.001),
                 region.group,
                 region.off_by,
+                angle.cos(),
+                angle.sin(),
             )
         };
 
@@ -457,20 +466,31 @@ impl SamplerState {
             pending_release: false,
             decay_per_sample: decay_per_sample(release_time as f64, self.sample_rate),
             is_release_trigger,
+            started_at: self.frame_count,
+            pan_l,
+            pan_r,
         });
     }
 
-    fn spawn_release_voice(&mut self, region_idx: usize, note: u8, velocity: u8) {
-        let (playback_rate, amplitude, release_time, group, off_by) = {
+    fn spawn_release_voice(&mut self, region_idx: usize, note: u8, velocity: u8, held_secs: f32) {
+        let (playback_rate, mut amplitude, release_time, group, off_by, rt_decay, pan_l, pan_r) = {
             let region = &self.regions[region_idx];
+            let angle = std::f32::consts::FRAC_PI_4 * (region.pan / 100.0 + 1.0);
             (
                 compute_playback_rate(note, region),
                 compute_amplitude(velocity, region),
                 region.ampeg_release.max(0.1),
                 region.group,
                 region.off_by,
+                region.rt_decay,
+                angle.cos(),
+                angle.sin(),
             )
         };
+
+        if rt_decay > 0.0 {
+            amplitude *= 10.0_f32.powf(-rt_decay * held_secs / 20.0);
+        }
 
         let slot_idx = self.find_free_voice();
         self.voices[slot_idx] = Some(Voice {
@@ -486,6 +506,9 @@ impl SamplerState {
             pending_release: false,
             decay_per_sample: decay_per_sample(release_time as f64, self.sample_rate),
             is_release_trigger: true,
+            started_at: self.frame_count,
+            pan_l,
+            pan_r,
         });
     }
 
@@ -505,6 +528,23 @@ impl SamplerState {
     }
 }
 
+/// Catmull-Rom / Hermite cubic interpolation between p1 and p2.
+/// p0 and p3 are the surrounding control points; t in [0, 1).
+#[inline]
+fn hermite(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
+    let a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3;
+    let b =        p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
+    let c = -0.5 * p0             + 0.5 * p2;
+    ((a * t + b) * t + c) * t + p1
+}
+
+/// Read one stereo frame from interleaved PCM data, clamping to the last valid frame.
+#[inline]
+fn sample_at(data: &[f32], frames: usize, i: usize) -> (f32, f32) {
+    let i = i.min(frames.saturating_sub(1));
+    (data[i * 2], data[i * 2 + 1])
+}
+
 fn begin_release(v: &mut Voice) {
     v.envelope = EnvelopeState::Releasing {
         amplitude: 1.0,
@@ -519,7 +559,8 @@ fn decay_per_sample(release_time_s: f64, sample_rate: f64) -> f32 {
 
 fn compute_playback_rate(note: u8, region: &Region) -> f64 {
     let semitones = (note as f64 - region.pitch_keycenter as f64)
-        * (region.pitch_keytrack as f64 / 100.0);
+        * (region.pitch_keytrack as f64 / 100.0)
+        + region.tune_cents as f64 / 100.0;
     2.0_f64.powf(semitones / 12.0)
 }
 
@@ -530,15 +571,24 @@ fn compute_amplitude(velocity: u8, region: &Region) -> f32 {
     vel_gain * linear_gain
 }
 
-/// Simple LCG-based pseudo-random f32 in [0, 1). Not cryptographic, but
+/// Simple xorshift-based pseudo-random f32 in [0, 1). Not cryptographic, but
 /// safe for round-robin selection in a real-time context (no allocation).
+/// Seeded from the system clock on first call.
 fn rand_f32() -> f32 {
     use std::cell::Cell;
+    use std::time::{SystemTime, UNIX_EPOCH};
     thread_local! {
-        static STATE: Cell<u64> = Cell::new(12345678901234567);
+        static STATE: Cell<u64> = const { Cell::new(0) };
     }
     STATE.with(|s| {
         let mut x = s.get();
+        if x == 0 {
+            x = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(1)
+                | 1;
+        }
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;

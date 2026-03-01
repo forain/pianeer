@@ -115,6 +115,7 @@ fn read_loop_points(
 
 // ─── Region builder helpers ──────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn attack_region(
     sample: PathBuf,
     midi_note: u8,
@@ -123,6 +124,7 @@ fn attack_region(
     volume_db: f32,
     loop_start: Option<u64>,
     loop_end: Option<u64>,
+    tune_cents: f32,
 ) -> Region {
     Region {
         sample,
@@ -145,13 +147,15 @@ fn attack_region(
         group: None,
         off_by: None,
         pitch_keytrack: 100.0,
+        pan: 0.0,
+        tune_cents,
         loop_start,
         loop_end,
         note_polyphony: None,
     }
 }
 
-fn release_region(sample: PathBuf, midi_note: u8, volume_db: f32) -> Region {
+fn release_region(sample: PathBuf, midi_note: u8, volume_db: f32, tune_cents: f32) -> Region {
     Region {
         sample,
         lokey: midi_note,
@@ -171,6 +175,8 @@ fn release_region(sample: PathBuf, midi_note: u8, volume_db: f32) -> Region {
         group: None,
         off_by: None,
         pitch_keytrack: 100.0,
+        pan: 0.0,
+        tune_cents,
         loop_start: None,
         loop_end: None,
         note_polyphony: None,
@@ -220,6 +226,14 @@ pub fn parse_organ(organ_path: &Path) -> Result<Vec<Region>, String> {
         let gain_db = get_f32(rank_sec, "Gain", 0.0);
         let volume_db = amplitude_level_to_db(amplitude_level) + gain_db;
 
+        // Pitch offset from harmonic number and MIDI pitch fraction.
+        // HarmonicNumber=8 is unison (8' pitch); e.g. 4 → one octave up (+1200 cents).
+        // MidiPitchFraction is in 1/1000 semitone units (0.1 cent per unit).
+        let harmonic_number = get_f32(rank_sec, "HarmonicNumber", 8.0);
+        let midi_pitch_fraction = get_f32(rank_sec, "MidiPitchFraction", 0.0);
+        let tune_cents = 1200.0 * f32::log2(harmonic_number / 8.0)
+            + midi_pitch_fraction / 10.0;
+
         for pipe_idx in 1..=n_pipes {
             let pipe_prefix = format!("Pipe{:03}", pipe_idx);
             let midi_note = first_midi.saturating_add((pipe_idx - 1) as u8);
@@ -242,7 +256,7 @@ pub fn parse_organ(organ_path: &Path) -> Result<Vec<Region>, String> {
                 // Simple case: the Pipe key value is the sole attack sample.
                 let (ls, le) = read_loop_points(rank_sec, &pipe_prefix);
                 let path = resolve_path(base_dir, &base_filename);
-                regions.push(attack_region(path, midi_note, 0, 127, volume_db, ls, le));
+                regions.push(attack_region(path, midi_note, 0, 127, volume_db, ls, le, tune_cents));
             } else {
                 // Multiple velocity-layered attacks.
                 // The base pipe entry is attack #0; Attack001..N are additional.
@@ -273,7 +287,7 @@ pub fn parse_organ(organ_path: &Path) -> Result<Vec<Region>, String> {
                         127
                     };
                     let path = resolve_path(base_dir, filename);
-                    regions.push(attack_region(path, midi_note, *lovel, hivel, volume_db, *ls, *le));
+                    regions.push(attack_region(path, midi_note, *lovel, hivel, volume_db, *ls, *le, tune_cents));
                 }
             }
 
@@ -286,7 +300,7 @@ pub fn parse_organ(organ_path: &Path) -> Result<Vec<Region>, String> {
                     None => continue,
                 };
                 let path = resolve_path(base_dir, &filename);
-                regions.push(release_region(path, midi_note, volume_db));
+                regions.push(release_region(path, midi_note, volume_db, tune_cents));
             }
         }
     }

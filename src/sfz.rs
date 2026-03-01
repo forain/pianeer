@@ -3,7 +3,7 @@
 /// Handles the opcodes actually present in the file:
 ///   sample, lokey, hikey, lovel, hivel, pitch_keycenter,
 ///   amp_veltrack, ampeg_release, volume, trigger, rt_decay,
-///   lorand, hirand, on_locc64, on_hicc64, group, off_by, pitch_keytrack
+///   lorand, hirand, on_locc64, on_hicc64, group, off_by, pitch_keytrack, pan
 use std::path::Path;
 
 pub use crate::region::{Region, Trigger};
@@ -21,6 +21,7 @@ struct GroupState {
     group: Option<u32>,
     off_by: Option<u32>,
     pitch_keytrack: Option<f32>,
+    pan: Option<f32>,
     lokey: Option<u8>,
     hikey: Option<u8>,
     lovel: Option<u8>,
@@ -28,11 +29,50 @@ struct GroupState {
     note_polyphony: Option<u32>,
 }
 
+/// Recursively expand `#include "file"` directives in SFZ content.
+/// Lines with `//` comments are stripped before checking for `#include`.
+/// Depth-limited to 8 levels.
+fn expand_includes(content: &str, base_dir: &Path, depth: usize) -> Result<String, String> {
+    if depth > 8 {
+        return Err("SFZ #include depth limit exceeded".to_string());
+    }
+    let mut result = String::new();
+    for line in content.lines() {
+        // Strip // comments to detect #include directives.
+        let stripped = if let Some(idx) = line.find("//") {
+            line[..idx].trim()
+        } else {
+            line.trim()
+        };
+
+        if let Some(rest) = stripped.strip_prefix("#include") {
+            let rest = rest.trim();
+            if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
+                let filename = &rest[1..rest.len() - 1];
+                let include_path = base_dir.join(filename.replace('\\', "/"));
+                let include_dir = include_path.parent().unwrap_or(base_dir);
+                let include_content = std::fs::read_to_string(&include_path)
+                    .map_err(|e| format!("Failed to read #include {:?}: {}", include_path, e))?;
+                let expanded = expand_includes(&include_content, include_dir, depth + 1)?;
+                result.push_str(&expanded);
+                result.push('\n');
+                continue;
+            }
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+    Ok(result)
+}
+
 pub fn parse_sfz(sfz_path: &Path) -> Result<Vec<Region>, String> {
-    let content = std::fs::read_to_string(sfz_path)
+    let raw = std::fs::read_to_string(sfz_path)
         .map_err(|e| format!("Failed to read SFZ: {}", e))?;
 
     let base_dir = sfz_path.parent().unwrap_or(Path::new("."));
+
+    let content = expand_includes(&raw, base_dir, 0)
+        .map_err(|e| format!("SFZ include error: {}", e))?;
 
     let mut regions = Vec::new();
     let mut global = GroupState::default();
@@ -153,6 +193,7 @@ fn region_from_group(g: &GroupState) -> Region {
     r.group = g.group;
     r.off_by = g.off_by;
     if let Some(v) = g.pitch_keytrack { r.pitch_keytrack = v; }
+    if let Some(v) = g.pan { r.pan = v; }
     if let Some(v) = g.lokey { r.lokey = v; }
     if let Some(v) = g.hikey { r.hikey = v; }
     if let Some(v) = g.lovel { r.lovel = v; }
@@ -173,6 +214,7 @@ fn apply_opcode_to_group(g: &mut GroupState, key: &str, val: &str) {
         "group" => g.group = val.parse().ok(),
         "off_by" => g.off_by = val.parse().ok(),
         "pitch_keytrack" => g.pitch_keytrack = val.parse().ok(),
+        "pan" => g.pan = val.parse().ok(),
         "lokey" => g.lokey = parse_key(val),
         "hikey" => g.hikey = parse_key(val),
         "lovel" => g.lovel = val.parse().ok(),
@@ -205,6 +247,7 @@ fn apply_opcode_to_region(r: &mut Region, key: &str, val: &str, base_dir: &Path)
         "group" => r.group = val.parse().ok(),
         "off_by" => r.off_by = val.parse().ok(),
         "pitch_keytrack" => { if let Some(v) = val.parse().ok() { r.pitch_keytrack = v; } }
+        "pan" => { if let Ok(v) = val.parse() { r.pan = v; } }
         "note_polyphony" => r.note_polyphony = val.parse().ok(),
         _ => {}
     }

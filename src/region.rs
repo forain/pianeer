@@ -48,6 +48,10 @@ pub struct Region {
     pub off_by: Option<u32>,
     /// Pitch tracking in cents per semitone. Default 100.
     pub pitch_keytrack: f32,
+    /// Pan position (-100 = full left, 0 = centre, 100 = full right).
+    pub pan: f32,
+    /// Pitch offset in cents (positive = sharper). Used for ODF HarmonicNumber tuning.
+    pub tune_cents: f32,
     /// Loop start position in sample frames (None = no loop).
     pub loop_start: Option<u64>,
     /// Loop end position in sample frames, inclusive (None = no loop).
@@ -77,6 +81,8 @@ impl Default for Region {
             group: None,
             off_by: None,
             pitch_keytrack: 100.0,
+            pan: 0.0,
+            tune_cents: 0.0,
             loop_start: None,
             loop_end: None,
             note_polyphony: None,

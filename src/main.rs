@@ -53,6 +53,31 @@ impl NotificationHandler for Notifications {
     }
 }
 
+// ─── Sample rate probing ──────────────────────────────────────────────────────
+
+/// Open a file with Symphonia and read the codec sample rate without decoding audio.
+fn probe_sample_rate(path: &Path) -> Option<u32> {
+    use symphonia::core::codecs::CODEC_TYPE_NULL;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .ok()?;
+    probed.format.tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .and_then(|t| t.codec_params.sample_rate)
+}
+
 // ─── Sample loading ───────────────────────────────────────────────────────────
 
 fn load_sample(path: &Path, loop_start: Option<u64>, loop_end: Option<u64>) -> Result<LoadedSample, String> {
@@ -260,14 +285,42 @@ fn main() {
         Err(e) => { eprintln!("{}", e); std::process::exit(1); }
     };
 
-    // 4. Create JACK client.
+    // 4. Probe sample rate from the first region's sample file.
+    let probed_rate: Option<u32> = regions.iter()
+        .find(|r| !r.sample.as_os_str().is_empty())
+        .and_then(|r| probe_sample_rate(&r.sample));
+
+    if let Some(rate) = probed_rate {
+        let existing = std::env::var("PIPEWIRE_PROPS").unwrap_or_default();
+        if !existing.contains("audio.rate") {
+            let props = if existing.is_empty() {
+                format!("audio.rate={}", rate)
+            } else {
+                format!("audio.rate={} {}", rate, existing)
+            };
+            std::env::set_var("PIPEWIRE_PROPS", &props);
+            println!("Set PIPEWIRE_PROPS audio.rate={}", rate);
+        }
+    }
+
+    // 5. Create JACK client.
     let (client, _status) = Client::new("pianeer", ClientOptions::NO_START_SERVER)
         .expect("Failed to open JACK client. Is JACK/PipeWire running?");
 
     let sample_rate = client.sample_rate() as f64;
     println!("JACK sample rate: {} Hz", sample_rate);
 
-    // 5. Register output ports.
+    if let Some(probed) = probed_rate {
+        if probed != client.sample_rate() {
+            eprintln!(
+                "Warning: JACK sample rate ({} Hz) differs from sample file rate ({} Hz); \
+                 pitch and timing may be incorrect.",
+                client.sample_rate(), probed
+            );
+        }
+    }
+
+    // 6. Register output ports.
     let out_l = client
         .register_port("out_L", AudioOut::default())
         .expect("Failed to register out_L");
@@ -275,10 +328,10 @@ fn main() {
         .register_port("out_R", AudioOut::default())
         .expect("Failed to register out_R");
 
-    // 6. Set up MIDI channel.
+    // 7. Set up MIDI channel.
     let (midi_tx, midi_rx) = bounded::<MidiEvent>(4096);
 
-    // 7. Build sampler state.
+    // 8. Build sampler state.
     let state = Arc::new(Mutex::new(SamplerState::new(
         regions,
         samples,
@@ -286,7 +339,7 @@ fn main() {
         midi_rx,
     )));
 
-    // 8. Start MIDI input thread.
+    // 9. Start MIDI input thread.
     let _midi_conn = match midi::start_midi(midi_tx.clone()) {
         Ok(conn) => {
             println!("MIDI input connected.");
@@ -299,7 +352,7 @@ fn main() {
         }
     };
 
-    // 9. Activate JACK client with process callback.
+    // 10. Activate JACK client with process callback.
     let processor = PianoProcessor {
         out_l,
         out_r,
@@ -310,13 +363,13 @@ fn main() {
         .activate_async(Notifications, processor)
         .expect("Failed to activate JACK client");
 
-    // 10. Warm up: trigger a silent note before connecting outputs.
+    // 11. Warm up: trigger a silent note before connecting outputs.
     let _ = midi_tx.send(MidiEvent::NoteOn { channel: 0, note: 60, velocity: 1 });
     thread::sleep(Duration::from_millis(150));
     let _ = midi_tx.send(MidiEvent::AllNotesOff);
     thread::sleep(Duration::from_millis(50));
 
-    // 11. Auto-connect to system playback ports.
+    // 12. Auto-connect to system playback ports.
     let jack_client = active_client.as_client();
     let all_ports = jack_client.ports(None, None, jack::PortFlags::IS_INPUT);
     let playback_fl = all_ports.iter().find(|p| p.contains("playback_FL") || p.contains("playback_1")).cloned();
@@ -344,15 +397,15 @@ fn main() {
         eprintln!("Warning: could not find playback_FR port.");
     }
 
-    // 12. Enable raw mode and show menu.
+    // 13. Enable raw mode and show menu.
     terminal::enable_raw_mode().expect("Failed to enable raw mode");
     print_menu(&instruments, 0);
 
-    // 13. Set up quit flag and switch channel.
+    // 14. Set up quit flag and switch channel.
     let quit = Arc::new(AtomicBool::new(false));
     let (switch_tx, switch_rx) = bounded::<usize>(8);
 
-    // 14. Spawn input thread (reads crossterm key events).
+    // 15. Spawn input thread (reads crossterm key events).
     let quit_input = Arc::clone(&quit);
     thread::spawn(move || {
         loop {
@@ -385,7 +438,7 @@ fn main() {
         }
     });
 
-    // 15. Main loop: handle quit and instrument switches.
+    // 16. Main loop: handle quit and instrument switches.
     let mut current = 0usize;
     loop {
         thread::sleep(Duration::from_millis(100));
