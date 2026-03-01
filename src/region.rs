@@ -56,6 +56,8 @@ pub struct Region {
     pub loop_start: Option<u64>,
     /// Loop end position in sample frames, inclusive (None = no loop).
     pub loop_end: Option<u64>,
+    /// If true, note-off is ignored — the sample plays to its natural end (SFZ loop_mode=one_shot).
+    pub one_shot: bool,
     /// Maximum simultaneous voices for the same MIDI note (None = unlimited).
     pub note_polyphony: Option<u32>,
     /// Maximum key-press duration (ms) for which this release sample is eligible.
@@ -112,6 +114,7 @@ impl Default for Region {
             tune_cents: 0.0,
             loop_start: None,
             loop_end: None,
+            one_shot: false,
             note_polyphony: None,
             max_key_press_ms: -1,
             sw_last: None,

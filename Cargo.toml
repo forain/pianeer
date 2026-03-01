@@ -7,6 +7,10 @@ edition = "2021"
 name = "pianeer"
 path = "src/main.rs"
 
+[[bin]]
+name = "wav2flac"
+path = "src/wav2flac.rs"
+
 [dependencies]
 jack = "0.13"
 midir = "0.9"
@@ -15,6 +19,9 @@ crossbeam-channel = "0.5"
 crossterm = "0.27"
 midly = "0.5"
 flate2 = "1"
+hound = "3"
+flacenc = "0.4"
+rayon = "1"
 
 [profile.release]
 opt-level = 3

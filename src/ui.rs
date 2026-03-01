@@ -119,12 +119,13 @@ impl VeltrackLevel {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum TunePreset { A415, A440, A442, A444 }
+pub enum TunePreset { A415, A432, A440, A442, A444 }
 
 impl TunePreset {
     pub fn cycle(self) -> Self {
         match self {
-            Self::A415 => Self::A440,
+            Self::A415 => Self::A432,
+            Self::A432 => Self::A440,
             Self::A440 => Self::A442,
             Self::A442 => Self::A444,
             Self::A444 => Self::A415,
@@ -133,6 +134,7 @@ impl TunePreset {
     pub fn label(self) -> &'static str {
         match self {
             Self::A415 => "A415",
+            Self::A432 => "A432",
             Self::A440 => "A440",
             Self::A442 => "A442",
             Self::A444 => "A444",
@@ -142,6 +144,7 @@ impl TunePreset {
     pub fn semitones(self) -> f32 {
         match self {
             Self::A415 => -1.0022,
+            Self::A432 => -0.3177,
             Self::A440 =>  0.0,
             Self::A442 =>  0.0785,
             Self::A444 =>  0.1576,

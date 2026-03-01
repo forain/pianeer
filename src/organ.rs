@@ -245,6 +245,10 @@ pub fn parse_organ(organ_path: &Path) -> Result<Vec<Region>, String> {
                 None => continue,
             };
 
+            // Per-pipe pitch correction (cents), added on top of rank-level tune_cents.
+            let pipe_pitch_tuning = get_f32(rank_sec, &format!("{}PitchTuning", pipe_prefix), 0.0);
+            let pipe_tune_cents = tune_cents + pipe_pitch_tuning;
+
             // Skip DUMMY and REF: entries.
             if base_filename.eq_ignore_ascii_case("DUMMY")
                 || base_filename.starts_with("REF:")
@@ -258,7 +262,7 @@ pub fn parse_organ(organ_path: &Path) -> Result<Vec<Region>, String> {
                 // Simple case: the Pipe key value is the sole attack sample.
                 let (ls, le) = read_loop_points(rank_sec, &pipe_prefix);
                 let path = resolve_path(base_dir, &base_filename);
-                regions.push(attack_region(path, midi_note, 0, 127, volume_db, ls, le, tune_cents));
+                regions.push(attack_region(path, midi_note, 0, 127, volume_db, ls, le, pipe_tune_cents));
             } else {
                 // Multiple velocity-layered attacks.
                 // The base pipe entry is attack #0; Attack001..N are additional.
@@ -289,7 +293,7 @@ pub fn parse_organ(organ_path: &Path) -> Result<Vec<Region>, String> {
                         127
                     };
                     let path = resolve_path(base_dir, filename);
-                    regions.push(attack_region(path, midi_note, *lovel, hivel, volume_db, *ls, *le, tune_cents));
+                    regions.push(attack_region(path, midi_note, *lovel, hivel, volume_db, *ls, *le, pipe_tune_cents));
                 }
             }
 
@@ -306,7 +310,7 @@ pub fn parse_organ(organ_path: &Path) -> Result<Vec<Region>, String> {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(-1);
                 let path = resolve_path(base_dir, &filename);
-                regions.push(release_region(path, midi_note, volume_db, tune_cents, max_kp_ms));
+                regions.push(release_region(path, midi_note, volume_db, pipe_tune_cents, max_kp_ms));
             }
         }
     }

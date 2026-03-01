@@ -157,6 +157,12 @@ fn main() {
         first_sw_def,
     )));
 
+    // Auto-detect the pitch offset needed to make A4 (note 69) sound at 440 Hz.
+    let mut auto_tune: f32 = state.lock().unwrap().detect_a4_tune_correction();
+    if let Ok(ref mut s) = state.lock() {
+        s.master_tune_semitones = auto_tune; // settings.tune defaults to A440 (0.0)
+    }
+
     // 10. Start MIDI input thread.
     let _midi_conn = match midi::start_midi(midi_tx.clone()) {
         Ok(conn) => {
@@ -181,13 +187,7 @@ fn main() {
         .activate_async(Notifications, processor)
         .expect("Failed to activate JACK client");
 
-    // 12. Warm up: trigger a silent note before connecting outputs.
-    let _ = midi_tx.send(MidiEvent::NoteOn { channel: 0, note: 60, velocity: 1 });
-    thread::sleep(Duration::from_millis(150));
-    let _ = midi_tx.send(MidiEvent::AllNotesOff);
-    thread::sleep(Duration::from_millis(50));
-
-    // 13. Auto-connect to system playback ports.
+    // 12. Auto-connect to system playback ports.
     let jack_client = active_client.as_client();
     let all_ports = jack_client.ports(None, None, jack::PortFlags::IS_INPUT);
     let playback_fl = all_ports.iter().find(|p| p.contains("playback_FL") || p.contains("playback_1")).cloned();
@@ -424,7 +424,7 @@ fn main() {
                 MenuAction::CycleTune => {
                     settings.tune = settings.tune.cycle();
                     if let Ok(ref mut s) = state.lock() {
-                        s.master_tune_semitones = settings.tune.semitones();
+                        s.master_tune_semitones = auto_tune + settings.tune.semitones();
                     }
                     print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats);
                 }
@@ -475,6 +475,8 @@ fn main() {
                                             loaded.cc_defaults,
                                             loaded.sw_lokey, loaded.sw_hikey, loaded.sw_default,
                                         );
+                                        auto_tune = s.detect_a4_tune_correction();
+                                        s.master_tune_semitones = auto_tune + settings.tune.semitones();
                                     }
                                     current = idx;
                                     current_path = new_path;

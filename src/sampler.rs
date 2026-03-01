@@ -63,6 +63,8 @@ struct Voice {
     /// Precomputed release decay per sample.
     decay_per_sample: f32,
     is_release_trigger: bool,
+    /// If true, note-off does not trigger release — sample plays to its natural end.
+    one_shot: bool,
     /// Frame index when this voice was spawned (for rt_decay and voice stealing).
     started_at: u64,
     /// Equal-power pan gain for left channel.
@@ -393,7 +395,7 @@ impl SamplerState {
 
         for slot in self.voices.iter_mut() {
             if let Some(ref mut v) = slot {
-                if v.note == note && !v.is_release_trigger {
+                if v.note == note && !v.is_release_trigger && !v.one_shot {
                     if self.sustain_pedal {
                         v.pending_release = true;
                     } else {
@@ -468,7 +470,7 @@ impl SamplerState {
         if was_held && !held {
             for slot in self.voices.iter_mut() {
                 if let Some(ref mut v) = slot {
-                    if v.pending_release && !v.is_release_trigger {
+                    if v.pending_release && !v.is_release_trigger && !v.one_shot {
                         begin_release(v);
                     }
                 }
@@ -590,7 +592,7 @@ impl SamplerState {
         let cc = &self.cc_values;
         let extra_semitones = self.master_tune_semitones;
         let veltrack_override = self.veltrack_override;
-        let (playback_rate, amplitude, release_time, group, off_by, pan_l, pan_r, start_pos, off_time) = {
+        let (playback_rate, amplitude, release_time, group, off_by, pan_l, pan_r, start_pos, off_time, one_shot) = {
             let region = &self.regions[region_idx];
             let eff_veltrack = veltrack_override
                 .unwrap_or_else(|| effective_veltrack(region, cc));
@@ -610,6 +612,7 @@ impl SamplerState {
                 angle.sin(),
                 start as f64,
                 region.off_time,
+                region.one_shot,
             )
         };
 
@@ -627,6 +630,7 @@ impl SamplerState {
             pending_release: false,
             decay_per_sample: decay_per_sample(release_time as f64, self.sample_rate),
             is_release_trigger,
+            one_shot,
             started_at: self.frame_count,
             pan_l,
             pan_r,
@@ -678,6 +682,7 @@ impl SamplerState {
             pending_release: false,
             decay_per_sample: decay_per_sample(release_time as f64, self.sample_rate),
             is_release_trigger: true,
+            one_shot: false,
             started_at: self.frame_count,
             pan_l,
             pan_r,
@@ -687,6 +692,77 @@ impl SamplerState {
 
     pub fn sample_rate(&self) -> f64 {
         self.sample_rate
+    }
+
+    /// Analyse the loaded sample for MIDI note 69 (A4) and return the
+    /// `master_tune_semitones` offset that makes it sound at exactly 440 Hz.
+    /// Returns 0.0 if no suitable region/sample is found or detection fails.
+    pub fn detect_a4_tune_correction(&self) -> f32 {
+        // First pass: detect using the region whose pitch_keycenter is closest to A4.
+        let first = match self.pitch_correction_for_keycenter(69) {
+            Some(v) => v,
+            None => return 0.0,
+        };
+
+        // If the correction is larger than half a semitone, the instrument's actual A4
+        // is closer in pitch to a different recorded note. Re-detect using the sample
+        // whose pitch_keycenter is closest to that note for a better-centred search.
+        if first.abs() <= 0.5 {
+            return first;
+        }
+        let better_keycenter = (69.0 - first).round().clamp(21.0, 108.0) as u8;
+        self.pitch_correction_for_keycenter(better_keycenter)
+            .unwrap_or(first)
+    }
+
+    /// Find the attack region covering MIDI note 69 whose `pitch_keycenter` is
+    /// closest to `target_keycenter`, extract its highest-energy window, run
+    /// autocorrelation, and return the semitone correction to make A4 = 440 Hz.
+    fn pitch_correction_for_keycenter(&self, target_keycenter: u8) -> Option<f32> {
+        let (idx, region) = self.regions.iter().enumerate()
+            .filter(|(_, r)| {
+                r.lokey <= 69 && r.hikey >= 69
+                    && r.trigger == Trigger::Attack
+                    && r.cc_trigger.is_empty()
+            })
+            .min_by_key(|(_, r)| {
+                let dist = (r.pitch_keycenter as i32 - target_keycenter as i32).unsigned_abs();
+                (dist, r.lovel)
+            })?;
+
+        let sample = self.samples[idx].as_ref()?;
+
+        // Find the highest-energy 4096-frame window, searching from 5 ms to 500 ms.
+        // This works for both sustained organs (energy is flat) and plucked strings
+        // (energy peaks shortly after the pluck and then decays).
+        const WIN: usize = 4096;
+        let search_start = ((0.005 * self.sample_rate) as usize).min(sample.frames);
+        let search_end = ((0.500 * self.sample_rate) as usize).min(sample.frames);
+        if search_end < search_start + WIN {
+            return None;
+        }
+        let step = WIN / 4;
+        let best_start = (search_start..=search_end.saturating_sub(WIN))
+            .step_by(step)
+            .max_by(|&a, &b| {
+                let ea: f32 = sample.data[a * 2..(a + WIN) * 2].iter().map(|&x| x * x).sum();
+                let eb: f32 = sample.data[b * 2..(b + WIN) * 2].iter().map(|&x| x * x).sum();
+                ea.partial_cmp(&eb).unwrap()
+            })
+            .unwrap_or(search_start);
+        let mono: Vec<f32> = (0..WIN)
+            .map(|i| sample.data[(best_start + i) * 2])
+            .collect();
+
+        // Expected raw-sample frequency = 440 Hz / playback-rate-for-note-69.
+        let rate = compute_playback_rate(69, region, 0.0);
+        let expected_hz = 440.0 / rate;
+
+        let f_detected = detect_fundamental_hz(&mono, self.sample_rate, expected_hz)?;
+
+        // Correction that brings f_detected * rate to 440 Hz.
+        let output_hz = f_detected * rate;
+        Some(-12.0 * (output_hz / 440.0).log2() as f32)
     }
 
     pub fn active_voice_count(&self) -> usize {
@@ -824,6 +900,53 @@ fn compute_playback_rate(note: u8, region: &Region, extra_semitones: f32) -> f64
         + region.tune_cents as f64 / 100.0
         + extra_semitones as f64;
     2.0_f64.powf(semitones / 12.0)
+}
+
+/// Detect the fundamental frequency of a mono audio window using autocorrelation.
+/// Searches ±2 semitones around `expected_hz`. Returns None if no clear peak found.
+fn detect_fundamental_hz(mono: &[f32], sr: f64, expected_hz: f64) -> Option<f64> {
+    let factor = 2.0_f64.powf(2.0 / 12.0); // ±2 semitones
+    let lag_min = ((sr / (expected_hz * factor)).floor() as usize).max(1);
+    let lag_max = ((sr / (expected_hz / factor)).ceil() as usize).min(mono.len() / 2);
+    if lag_min > lag_max {
+        return None;
+    }
+
+    let mut best_lag = 0usize;
+    let mut best_corr = f32::NEG_INFINITY;
+    for lag in lag_min..=lag_max {
+        let n = mono.len() - lag;
+        let corr = mono[..n].iter().zip(&mono[lag..])
+            .map(|(&a, &b)| a * b)
+            .sum::<f32>() / n as f32;
+        if corr > best_corr {
+            best_corr = corr;
+            best_lag = lag;
+        }
+    }
+    if best_lag == 0 || best_corr <= 0.0 {
+        return None;
+    }
+
+    // Parabolic interpolation for sub-sample accuracy.
+    let refined = if best_lag > lag_min && best_lag < lag_max {
+        let nm = mono.len() - (best_lag - 1);
+        let np = mono.len() - (best_lag + 1);
+        let cm = mono[..nm].iter().zip(&mono[best_lag - 1..])
+            .map(|(&a, &b)| a * b).sum::<f32>() / nm as f32;
+        let cp = mono[..np].iter().zip(&mono[best_lag + 1..])
+            .map(|(&a, &b)| a * b).sum::<f32>() / np as f32;
+        let denom = cm - 2.0 * best_corr + cp;
+        if denom.abs() > 1e-10 {
+            best_lag as f64 + 0.5 * (cm - cp) as f64 / denom as f64
+        } else {
+            best_lag as f64
+        }
+    } else {
+        best_lag as f64
+    };
+
+    Some(sr / refined)
 }
 
 fn compute_amplitude(velocity: u8, region: &Region, veltrack: f32) -> f32 {

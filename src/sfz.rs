@@ -4,7 +4,8 @@
 ///   #include (inline and line-start), #define macro expansion, default_path,
 ///   <global>/<master>/<group>/<region> hierarchy, tune, sw_last/sw_lokey/sw_hikey/sw_default,
 ///   locc$N/hicc$N, offset/offset_oncc$N, off_time, amplitude_oncc$N, pan_oncc$N,
-///   amp_veltrack_oncc$N, ampeg_release_oncc$N, set_cc$N, set_hdcc$N.
+///   amp_veltrack_oncc$N, ampeg_release_oncc$N, set_cc$N, set_hdcc$N,
+///   loop_mode/loop_start/loop_end (and loopmode/loopstart/loopend aliases).
 use std::path::{Path, PathBuf};
 
 pub use crate::region::{Region, Trigger};
@@ -25,6 +26,16 @@ impl Default for SfzMeta {
     fn default() -> Self {
         SfzMeta { cc_defaults: [0u8; 128], sw_lokey: 0, sw_hikey: 0, sw_default: None }
     }
+}
+
+// ── LoopMode ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+enum LoopMode {
+    NoLoop,
+    OneShot,
+    LoopContinuous,
+    LoopSustain,
 }
 
 // ── GroupState ────────────────────────────────────────────────────────────────
@@ -60,6 +71,9 @@ struct GroupState {
     cc_conds: Vec<(u8, u8, u8)>,
     offset: Option<u64>,
     offset_oncc: Option<(u8, u64)>,
+    loop_mode: Option<LoopMode>,
+    loop_start: Option<u64>,
+    loop_end: Option<u64>,
 }
 
 // ── #include expansion ────────────────────────────────────────────────────────
@@ -417,6 +431,7 @@ fn region_from_group(g: &GroupState) -> Region {
     r.amp_veltrack_oncc = g.amp_veltrack_oncc.clone();
     r.ampeg_release_oncc = g.ampeg_release_oncc.clone();
     r.cc_conds = g.cc_conds.clone();
+    apply_loop_to_region(&mut r, &g.loop_mode, g.loop_start, g.loop_end);
     r
 }
 
@@ -444,6 +459,9 @@ fn apply_opcode_to_group(g: &mut GroupState, key: &str, val: &str) {
         "sw_default" => g.sw_default = parse_key(val),
         "off_time" => g.off_time = val.parse().ok(),
         "offset" => g.offset = val.parse().ok(),
+        "loop_mode" | "loopmode" => g.loop_mode = parse_loop_mode(val),
+        "loop_start" | "loopstart" => g.loop_start = val.parse().ok(),
+        "loop_end"   | "loopend"   => g.loop_end   = val.parse().ok(),
         _ => {
             if let Some(v) = parse_oncc_val(key, val, "amplitude_oncc") {
                 set_cc_mod(&mut g.amplitude_oncc, v.0, v.1);
@@ -505,6 +523,27 @@ fn apply_opcode_to_region(
         "sw_last" => r.sw_last = parse_key(val),
         "off_time" => { if let Ok(v) = val.parse() { r.off_time = v; } }
         "offset" => { if let Ok(v) = val.parse() { r.offset = v; } }
+        "loop_mode" | "loopmode" => {
+            // At region level, mode takes effect immediately over already-set points.
+            match parse_loop_mode(val) {
+                Some(LoopMode::NoLoop) => {
+                    r.loop_start = None;
+                    r.loop_end = None;
+                }
+                Some(LoopMode::OneShot) => {
+                    r.loop_start = None;
+                    r.loop_end = None;
+                    r.one_shot = true;
+                }
+                _ => {} // loop_continuous / loop_sustain: loop_start/loop_end enable the loop
+            }
+        }
+        "loop_start" | "loopstart" => {
+            if let Ok(v) = val.parse() { r.loop_start = Some(v); }
+        }
+        "loop_end" | "loopend" => {
+            if let Ok(v) = val.parse() { r.loop_end = Some(v); }
+        }
         _ => {
             if let Some(v) = parse_oncc_val(key, val, "amplitude_oncc") {
                 set_cc_mod(&mut r.amplitude_oncc, v.0, v.1);
@@ -583,6 +622,43 @@ fn set_cc_mod(list: &mut Vec<(u8, f32)>, cc: u8, val: f32) {
         entry.1 = val;
     } else {
         list.push((cc, val));
+    }
+}
+
+fn parse_loop_mode(val: &str) -> Option<LoopMode> {
+    match val {
+        "no_loop"          => Some(LoopMode::NoLoop),
+        "one_shot"         => Some(LoopMode::OneShot),
+        "loop_continuous"  => Some(LoopMode::LoopContinuous),
+        "loop_sustain"     => Some(LoopMode::LoopSustain),
+        _ => None,
+    }
+}
+
+/// Apply group-level loop state to a freshly-created Region.
+/// Called from `region_from_group` after all group opcodes have been collected.
+fn apply_loop_to_region(r: &mut Region, mode: &Option<LoopMode>, start: Option<u64>, end: Option<u64>) {
+    match mode {
+        Some(LoopMode::LoopContinuous) | Some(LoopMode::LoopSustain) => {
+            r.loop_start = start;
+            r.loop_end = end;
+        }
+        Some(LoopMode::NoLoop) => {
+            r.loop_start = None;
+            r.loop_end = None;
+        }
+        Some(LoopMode::OneShot) => {
+            r.loop_start = None;
+            r.loop_end = None;
+            r.one_shot = true;
+        }
+        None => {
+            // No explicit mode: activate loop if both points were set at group level.
+            if start.is_some() && end.is_some() {
+                r.loop_start = start;
+                r.loop_end = end;
+            }
+        }
     }
 }
 
