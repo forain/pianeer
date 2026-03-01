@@ -26,9 +26,10 @@ fn parse_ini(content: &str) -> IniMap {
     let mut current: Option<String> = None;
 
     for raw_line in content.lines() {
-        // Strip ';' and '#' comments.
+        // Strip ';' comments (Grand Orgue ODF comment character).
+        // '#' is NOT stripped — it appears in sample filenames (e.g. "063-d#.wav").
         let line = raw_line
-            .find(|c| c == ';' || c == '#')
+            .find(';')
             .map(|i| &raw_line[..i])
             .unwrap_or(raw_line)
             .trim();

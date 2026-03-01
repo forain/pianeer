@@ -295,7 +295,7 @@ fn load_instrument_data(inst: &Instrument) -> Result<LoadedInstrument, String> {
 
 fn print_menu(menu: &[MenuItem], current: usize, playing: Option<usize>) {
     print!("\x1b[2J\x1b[H");
-    print!("Pianeer — press 1-9 to load instrument or play MIDI file, Q/Ctrl+C to quit:\r\n");
+    print!("Pianeer — 1-9: load/play  R: rescan  Q/Ctrl+C: quit\r\n");
 
     let has_midi = menu.iter().any(|m| matches!(m, MenuItem::MidiFile { .. }));
     let mut in_midi = false;
@@ -341,8 +341,9 @@ fn main() {
     }
 
     // 3. Discover MIDI files and build unified menu (instruments first, then MIDI files, ≤9).
-    let midi_files = match midi_player::find_midi_dir() {
-        Some(dir) => midi_player::discover(&dir),
+    let midi_dir = midi_player::find_midi_dir();
+    let midi_files = match midi_dir.as_ref() {
+        Some(dir) => midi_player::discover(dir),
         None => Vec::new(),
     };
     let mut menu: Vec<MenuItem> = raw_instruments.into_iter().map(MenuItem::Instrument).collect();
@@ -485,12 +486,14 @@ fn main() {
     terminal::enable_raw_mode().expect("Failed to enable raw mode");
     print_menu(&menu, 0, None);
 
-    // 14. Set up quit flag and switch channel.
+    // 14. Set up quit/reload flags and switch channel.
     let quit = Arc::new(AtomicBool::new(false));
+    let reload = Arc::new(AtomicBool::new(false));
     let (switch_tx, switch_rx) = bounded::<usize>(8);
 
     // 15. Spawn input thread (reads crossterm key events).
     let quit_input = Arc::clone(&quit);
+    let reload_input = Arc::clone(&reload);
     thread::spawn(move || {
         loop {
             if quit_input.load(Ordering::Relaxed) {
@@ -508,6 +511,9 @@ fn main() {
                                 quit_input.store(true, Ordering::SeqCst);
                                 break;
                             }
+                            KeyCode::Char('r') | KeyCode::Char('R') => {
+                                reload_input.store(true, Ordering::SeqCst);
+                            }
                             KeyCode::Char(c @ '1'..='9') => {
                                 let idx = (c as usize) - ('1' as usize);
                                 let _ = switch_tx.try_send(idx);
@@ -522,7 +528,7 @@ fn main() {
         }
     });
 
-    // 16. Main loop: handle quit, instrument switches, and MIDI file playback.
+    // 16. Main loop: handle quit, reload, instrument switches, and MIDI file playback.
     let mut current = 0usize; // index in `menu` of the loaded instrument
     let mut playback: Option<PlaybackState> = None;
     loop {
@@ -533,6 +539,34 @@ fn main() {
             terminal::disable_raw_mode().ok();
             println!("\r\nExiting...");
             break;
+        }
+
+        // Rescan instruments and MIDI files on R.
+        if reload.swap(false, Ordering::SeqCst) {
+            let current_path = match menu.get(current) {
+                Some(MenuItem::Instrument(i)) => Some(i.path.clone()),
+                _ => None,
+            };
+            let new_instruments = instruments::discover(&samples_dir);
+            let new_midi = match midi_dir.as_ref() {
+                Some(dir) => midi_player::discover(dir),
+                None => Vec::new(),
+            };
+            let mut new_menu: Vec<MenuItem> =
+                new_instruments.into_iter().map(MenuItem::Instrument).collect();
+            let remaining = 9usize.saturating_sub(new_menu.len());
+            for (name, path) in new_midi.into_iter().take(remaining) {
+                new_menu.push(MenuItem::MidiFile { name, path });
+            }
+            // Keep current index pointing at the same instrument if still present.
+            current = current_path
+                .and_then(|p| new_menu.iter().position(|m| {
+                    matches!(m, MenuItem::Instrument(i) if i.path == p)
+                }))
+                .unwrap_or(0);
+            menu = new_menu;
+            print_menu(&menu, current, playing_idx(&playback));
+            continue;
         }
 
         // Redraw if MIDI playback ended naturally.
