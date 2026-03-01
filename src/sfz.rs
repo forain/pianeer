@@ -231,6 +231,10 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<(Vec<Region>, SfzMeta), String> {
     let mut current_region = Region::default();
     let mut default_path = PathBuf::new();
     let mut cc_defaults = [0u8; 128];
+    // Keyswitch metadata is instrument-level and must survive <global> resets.
+    let mut sw_lokey: Option<u8> = None;
+    let mut sw_hikey: Option<u8> = None;
+    let mut sw_default: Option<u8> = None;
 
     for line in content.lines() {
         // Strip line comments.
@@ -268,6 +272,10 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<(Vec<Region>, SfzMeta), String> {
                             regions.push(current_region.clone());
                             in_region = false;
                         }
+                        // Preserve sw metadata before resetting (may be set in any global).
+                        if global.sw_lokey.is_some() { sw_lokey = global.sw_lokey; }
+                        if global.sw_hikey.is_some() { sw_hikey = global.sw_hikey; }
+                        if global.sw_default.is_some() { sw_default = global.sw_default; }
                         global = GroupState::default();
                         master = GroupState::default();
                         in_global = true;
@@ -340,11 +348,16 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<(Vec<Region>, SfzMeta), String> {
         regions.push(current_region);
     }
 
+    // Flush sw metadata from the final global section.
+    if global.sw_lokey.is_some() { sw_lokey = global.sw_lokey; }
+    if global.sw_hikey.is_some() { sw_hikey = global.sw_hikey; }
+    if global.sw_default.is_some() { sw_default = global.sw_default; }
+
     let meta = SfzMeta {
         cc_defaults,
-        sw_lokey: global.sw_lokey.unwrap_or(0),
-        sw_hikey: global.sw_hikey.unwrap_or(0),
-        sw_default: global.sw_default,
+        sw_lokey: sw_lokey.unwrap_or(0),
+        sw_hikey: sw_hikey.unwrap_or(0),
+        sw_default,
     };
 
     Ok((regions, meta))
