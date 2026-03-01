@@ -1,6 +1,7 @@
 mod region;
 mod sfz;
 mod organ;
+mod kontakt;
 mod sampler;
 mod midi;
 mod instruments;
@@ -100,8 +101,13 @@ fn probe_sample_rate(path: &Path) -> Option<u32> {
     use symphonia::core::meta::MetadataOptions;
     use symphonia::core::probe::Hint;
 
-    let file = std::fs::File::open(path).ok()?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut raw = std::fs::read(path).ok()?;
+    if path.extension().and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("wav")).unwrap_or(false)
+    {
+        fix_wav_fmt(&mut raw);
+    }
+    let mss = MediaSourceStream::new(Box::new(ByteSource(std::io::Cursor::new(raw))), Default::default());
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
@@ -117,6 +123,48 @@ fn probe_sample_rate(path: &Path) -> Option<u32> {
 
 // ─── Sample loading ───────────────────────────────────────────────────────────
 
+/// Fix a malformed WAV file where WAVE_FORMAT_PCM (fmt type 0x0001) has a
+/// non-16-byte fmt chunk. Symphonia rejects these; we trim the extra bytes
+/// and patch the sizes in place. No-op for non-WAV or already-valid files.
+fn fix_wav_fmt(data: &mut Vec<u8>) {
+    if data.len() < 28 { return; }
+    if &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" { return; }
+    let mut pos = 12usize;
+    while pos + 8 <= data.len() {
+        let chunk_size = u32::from_le_bytes([data[pos+4], data[pos+5], data[pos+6], data[pos+7]]) as usize;
+        if &data[pos..pos+4] == b"fmt " {
+            if chunk_size > 16 && pos + 8 + chunk_size <= data.len() {
+                let format = u16::from_le_bytes([data[pos+8], data[pos+9]]);
+                if format == 0x0001 {
+                    // Remove bytes beyond the standard 16-byte PCM fmt body.
+                    let remove_start = pos + 8 + 16;
+                    let remove_end = (pos + 8 + chunk_size + (chunk_size & 1)).min(data.len());
+                    data.drain(remove_start..remove_end);
+                    data[pos+4..pos+8].copy_from_slice(&16u32.to_le_bytes());
+                    let riff_size = (data.len() - 8) as u32;
+                    data[4..8].copy_from_slice(&riff_size.to_le_bytes());
+                }
+            }
+            return;
+        }
+        if chunk_size == 0 { break; }
+        pos += 8 + chunk_size + (chunk_size & 1);
+    }
+}
+
+/// Wrapper so a `Cursor<Vec<u8>>` can be used as a Symphonia `MediaSource`.
+struct ByteSource(std::io::Cursor<Vec<u8>>);
+impl std::io::Read for ByteSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> { self.0.read(buf) }
+}
+impl std::io::Seek for ByteSource {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> { self.0.seek(pos) }
+}
+impl symphonia::core::io::MediaSource for ByteSource {
+    fn is_seekable(&self) -> bool { true }
+    fn byte_len(&self) -> Option<u64> { Some(self.0.get_ref().len() as u64) }
+}
+
 fn load_sample(path: &Path, loop_start: Option<u64>, loop_end: Option<u64>) -> Result<LoadedSample, String> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
@@ -125,9 +173,14 @@ fn load_sample(path: &Path, loop_start: Option<u64>, loop_end: Option<u64>) -> R
     use symphonia::core::meta::MetadataOptions;
     use symphonia::core::probe::Hint;
 
-    let file = std::fs::File::open(path)
+    let mut raw = std::fs::read(path)
         .map_err(|e| format!("open {:?}: {}", path, e))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    if path.extension().and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("wav")).unwrap_or(false)
+    {
+        fix_wav_fmt(&mut raw);
+    }
+    let mss = MediaSourceStream::new(Box::new(ByteSource(std::io::Cursor::new(raw))), Default::default());
 
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -281,6 +334,12 @@ fn load_instrument_data(inst: &Instrument) -> Result<LoadedInstrument, String> {
             println!("Parsing Grand Orgue ODF: {}", inst.path.display());
             let regions = organ::parse_organ(&inst.path)
                 .map_err(|e| format!("Error parsing ODF: {}", e))?;
+            (regions, [0u8; 128], 0u8, 0u8, None)
+        }
+        "nki" | "nkm" => {
+            println!("Parsing Kontakt instrument: {}", inst.path.display());
+            let regions = kontakt::parse_kontakt(&inst.path)
+                .map_err(|e| format!("Error parsing NKI/NKM: {}", e))?;
             (regions, [0u8; 128], 0u8, 0u8, None)
         }
         other => return Err(format!("Unknown file extension '{}'", other)),

@@ -35,7 +35,15 @@ pub fn find_samples_dir() -> Option<PathBuf> {
 }
 
 fn is_instrument_file(path: &Path) -> bool {
-    matches!(path.extension().and_then(|e| e.to_str()), Some("sfz") | Some("organ"))
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("sfz") | Some("organ") | Some("nki") | Some("nkm")
+    )
+}
+
+/// True if `path` is an `.nki` file.
+fn is_nki(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("nki")
 }
 
 /// Scan one (or two) levels of subdirectories in `samples_dir` for `.sfz` and `.organ` files.
@@ -69,20 +77,29 @@ pub fn discover(samples_dir: &Path) -> Vec<Instrument> {
         };
         entries.sort_by_key(|e| e.file_name());
 
+        // If any .nki files are present, suppress .nkm files (they are redundant banks
+        // of the same programs).
+        let has_nki = entries.iter().any(|e| is_nki(&e.path()));
+
         let mut found_direct = false;
         for subentry in &entries {
             let file_path = subentry.path();
-            if is_instrument_file(&file_path) {
-                let filename = match file_path.file_name().and_then(|n| n.to_str()) {
-                    Some(n) => n.to_string(),
-                    None => continue,
-                };
-                instruments.push(Instrument {
-                    name: format!("{} / {}", subdir_name, filename),
-                    path: file_path,
-                });
-                found_direct = true;
+            if !is_instrument_file(&file_path) {
+                continue;
             }
+            // Skip .nkm when individual .nki files are available.
+            if has_nki && file_path.extension().and_then(|e| e.to_str()) == Some("nkm") {
+                continue;
+            }
+            let filename = match file_path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            instruments.push(Instrument {
+                name: format!("{} / {}", subdir_name, filename),
+                path: file_path,
+            });
+            found_direct = true;
         }
 
         if !found_direct {

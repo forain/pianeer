@@ -58,6 +58,10 @@ pub struct Region {
     pub loop_end: Option<u64>,
     /// Maximum simultaneous voices for the same MIDI note (None = unlimited).
     pub note_polyphony: Option<u32>,
+    /// Maximum key-press duration (ms) for which this release sample is eligible.
+    /// -1 = no limit (always eligible, used as long-hold fallback in organs).
+    /// Matches Grand Orgue's PipeNNNReleaseNNNMaxKeyPressTime.
+    pub max_key_press_ms: i32,
 
     // ── SFZ v2 / ARIA extensions ──────────────────────────────────────────────
 
@@ -110,6 +114,7 @@ impl Default for Region {
             loop_start: None,
             loop_end: None,
             note_polyphony: None,
+            max_key_press_ms: -1,
             sw_last: None,
             cc_conds: Vec::new(),
             offset: 0,

@@ -157,7 +157,7 @@ fn attack_region(
     }
 }
 
-fn release_region(sample: PathBuf, midi_note: u8, volume_db: f32, tune_cents: f32) -> Region {
+fn release_region(sample: PathBuf, midi_note: u8, volume_db: f32, tune_cents: f32, max_key_press_ms: i32) -> Region {
     Region {
         sample,
         lokey: midi_note,
@@ -182,6 +182,7 @@ fn release_region(sample: PathBuf, midi_note: u8, volume_db: f32, tune_cents: f3
         loop_start: None,
         loop_end: None,
         note_polyphony: None,
+        max_key_press_ms,
         ..Region::default()
     }
 }
@@ -302,8 +303,12 @@ pub fn parse_organ(organ_path: &Path) -> Result<Vec<Region>, String> {
                     Some(v) => v.trim().to_string(),
                     None => continue,
                 };
+                let max_kp_ms: i32 = rank_sec
+                    .get(&format!("{}MaxKeyPressTime", rp))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(-1);
                 let path = resolve_path(base_dir, &filename);
-                regions.push(release_region(path, midi_note, volume_db, tune_cents));
+                regions.push(release_region(path, midi_note, volume_db, tune_cents, max_kp_ms));
             }
         }
     }

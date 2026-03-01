@@ -358,8 +358,30 @@ impl SamplerState {
             }
             release_regions.push(idx);
         }
-        for region_idx in release_regions {
-            self.spawn_release_voice(region_idx, note, 64, held_secs);
+
+        // If any candidate has a timed MaxKeyPressTime (>= 0), use organ-style
+        // selection: pick the one with the smallest limit that is still >= held_ms,
+        // falling back to the unlimited (-1) candidate.
+        // Otherwise (all -1, e.g. SFZ) spawn all of them.
+        let held_ms = (held_secs * 1000.0) as i32;
+        let has_timed = release_regions.iter()
+            .any(|&i| self.regions[i].max_key_press_ms >= 0);
+        if has_timed {
+            let best = release_regions.iter().copied()
+                .filter(|&i| {
+                    let ms = self.regions[i].max_key_press_ms;
+                    ms >= 0 && ms >= held_ms
+                })
+                .min_by_key(|&i| self.regions[i].max_key_press_ms)
+                .or_else(|| release_regions.iter().copied()
+                    .find(|&i| self.regions[i].max_key_press_ms < 0));
+            if let Some(region_idx) = best {
+                self.spawn_release_voice(region_idx, note, 64, held_secs);
+            }
+        } else {
+            for region_idx in release_regions {
+                self.spawn_release_voice(region_idx, note, 64, held_secs);
+            }
         }
     }
 
