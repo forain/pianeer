@@ -130,40 +130,75 @@ fn expand_includes(content: &str, base_dir: &Path, depth: usize) -> Result<Strin
 
 // ── #define expansion ─────────────────────────────────────────────────────────
 
-/// Process `#define $NAME value` directives inline (ARIA extension).
-/// Each #define applies from its position downward (handles redefinition per group).
-/// #define lines are removed from the output.
+/// Parse a `#define $NAME VALUE` sequence at the start of `s`.
+/// Returns `(name, value, bytes_consumed)` or `None` if not valid.
+fn parse_define(s: &str) -> Option<(String, String, usize)> {
+    let rest = s.strip_prefix("#define")?;
+    let mut i = 0;
+    let b = rest.as_bytes();
+    // Skip horizontal whitespace.
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') { i += 1; }
+    if i >= b.len() || b[i] != b'$' { return None; }
+    let name_start = i;
+    while i < b.len() && !b[i].is_ascii_whitespace() { i += 1; }
+    let name = rest[name_start..i].to_string();
+    if name.len() <= 1 { return None; }
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') { i += 1; }
+    let val_start = i;
+    while i < b.len() && !b[i].is_ascii_whitespace() { i += 1; }
+    let value = rest[val_start..i].to_string();
+    if value.is_empty() { return None; }
+    Some((name, value, "#define".len() + i))
+}
+
+/// Expand `#define $NAME value` directives throughout the content.
+///
+/// Handles both line-leading and inline occurrences (e.g. `<region> #define $KEY 021 sample=…`).
+/// Each `#define` takes effect from its position downward and may be redefined.
 fn expand_defines(content: &str) -> String {
     let mut macros: Vec<(String, String)> = Vec::new();
     let mut result = String::with_capacity(content.len());
 
     for line in content.lines() {
-        let effective = if let Some(idx) = line.find("//") { &line[..idx] } else { line }.trim();
+        // Strip // comments.
+        let line = if let Some(idx) = line.find("//") { &line[..idx] } else { line };
 
-        if let Some(rest) = effective.strip_prefix("#define") {
-            let rest = rest.trim_start();
-            if let Some(ws) = rest.find(char::is_whitespace) {
-                let name = rest[..ws].to_string();
-                let value = rest[ws..].trim().to_string();
-                // Update existing or add new entry.
-                if let Some(entry) = macros.iter_mut().find(|(n, _)| n == &name) {
-                    entry.1 = value;
-                } else {
-                    macros.push((name, value));
+        // Scan the line for #define directives anywhere, collect them and build
+        // the cleaned line (defines removed).
+        let mut out = String::new();
+        let mut pos = 0;
+        loop {
+            match line[pos..].find("#define") {
+                None => { out.push_str(&line[pos..]); break; }
+                Some(rel) => {
+                    let abs = pos + rel;
+                    out.push_str(&line[pos..abs]);
+                    match parse_define(&line[abs..]) {
+                        Some((name, value, consumed)) => {
+                            if let Some(e) = macros.iter_mut().find(|(n, _)| n == &name) {
+                                e.1 = value;
+                            } else {
+                                macros.push((name, value));
+                            }
+                            pos = abs + consumed;
+                        }
+                        None => {
+                            out.push('#');
+                            pos = abs + 1;
+                        }
+                    }
                 }
-                // Don't emit #define lines.
-                continue;
             }
         }
 
-        // Apply current macro map to this line.
+        // Apply current macro map to the cleaned line.
         // Sort by name length descending so longer names match before shorter prefixes.
         if macros.is_empty() {
-            result.push_str(line);
+            result.push_str(&out);
         } else {
             let mut sorted: Vec<_> = macros.iter().collect();
             sorted.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-            let mut processed = line.to_string();
+            let mut processed = out;
             for (name, value) in sorted {
                 processed = processed.replace(name.as_str(), value.as_str());
             }
