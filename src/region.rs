@@ -52,6 +52,8 @@ pub struct Region {
     pub loop_start: Option<u64>,
     /// Loop end position in sample frames, inclusive (None = no loop).
     pub loop_end: Option<u64>,
+    /// Maximum simultaneous voices for the same MIDI note (None = unlimited).
+    pub note_polyphony: Option<u32>,
 }
 
 impl Default for Region {
@@ -77,6 +79,7 @@ impl Default for Region {
             pitch_keytrack: 100.0,
             loop_start: None,
             loop_end: None,
+            note_polyphony: None,
         }
     }
 }

@@ -25,6 +25,7 @@ struct GroupState {
     hikey: Option<u8>,
     lovel: Option<u8>,
     hivel: Option<u8>,
+    note_polyphony: Option<u32>,
 }
 
 pub fn parse_sfz(sfz_path: &Path) -> Result<Vec<Region>, String> {
@@ -156,6 +157,7 @@ fn region_from_group(g: &GroupState) -> Region {
     if let Some(v) = g.hikey { r.hikey = v; }
     if let Some(v) = g.lovel { r.lovel = v; }
     if let Some(v) = g.hivel { r.hivel = v; }
+    r.note_polyphony = g.note_polyphony;
     r
 }
 
@@ -175,6 +177,7 @@ fn apply_opcode_to_group(g: &mut GroupState, key: &str, val: &str) {
         "hikey" => g.hikey = parse_key(val),
         "lovel" => g.lovel = val.parse().ok(),
         "hivel" => g.hivel = val.parse().ok(),
+        "note_polyphony" => g.note_polyphony = val.parse().ok(),
         _ => {}
     }
 }
@@ -202,6 +205,7 @@ fn apply_opcode_to_region(r: &mut Region, key: &str, val: &str, base_dir: &Path)
         "group" => r.group = val.parse().ok(),
         "off_by" => r.off_by = val.parse().ok(),
         "pitch_keytrack" => { if let Some(v) = val.parse().ok() { r.pitch_keytrack = v; } }
+        "note_polyphony" => r.note_polyphony = val.parse().ok(),
         _ => {}
     }
 }

@@ -262,9 +262,15 @@ impl SamplerState {
         }
 
         for (region_idx, _) in &to_spawn {
-            let region = &self.regions[*region_idx];
-            if let Some(off_by_grp) = region.off_by {
-                self.kill_group(off_by_grp);
+            let (off_by_grp, max_poly) = {
+                let r = &self.regions[*region_idx];
+                (r.off_by, r.note_polyphony)
+            };
+            if let Some(g) = off_by_grp {
+                self.kill_group(g);
+            }
+            if let Some(p) = max_poly {
+                self.enforce_note_polyphony(note, p as usize);
             }
             self.spawn_voice(*region_idx, note, velocity, false);
         }
@@ -365,6 +371,25 @@ impl SamplerState {
         for slot in self.voices.iter_mut() {
             if let Some(ref mut v) = slot {
                 begin_release(v);
+            }
+        }
+    }
+
+    fn enforce_note_polyphony(&mut self, note: u8, max_poly: usize) {
+        let fast_decay = decay_per_sample(0.01, self.sample_rate);
+        let mut count = self.voices.iter()
+            .filter(|s| s.as_ref().map_or(false, |v| v.note == note && !v.is_release_trigger))
+            .count();
+        for slot in self.voices.iter_mut() {
+            if count < max_poly { break; }
+            if let Some(ref mut v) = slot {
+                if v.note == note && !v.is_release_trigger {
+                    v.envelope = EnvelopeState::Releasing {
+                        amplitude: 1.0,
+                        decay_per_sample: fast_decay,
+                    };
+                    count -= 1;
+                }
             }
         }
     }

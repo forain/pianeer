@@ -147,6 +147,7 @@ fn attack_region(
         pitch_keytrack: 100.0,
         loop_start,
         loop_end,
+        note_polyphony: None,
     }
 }
 
@@ -172,6 +173,7 @@ fn release_region(sample: PathBuf, midi_note: u8, volume_db: f32) -> Region {
         pitch_keytrack: 100.0,
         loop_start: None,
         loop_end: None,
+        note_polyphony: None,
     }
 }
 
