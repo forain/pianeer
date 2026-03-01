@@ -146,6 +146,6 @@ pub fn discover(samples_dir: &Path) -> Vec<Instrument> {
         }
     }
 
-    instruments.truncate(9);
+    instruments.truncate(16);
     instruments
 }
