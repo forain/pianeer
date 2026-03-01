@@ -9,8 +9,8 @@ A low-latency JACK audio sampler for keyboard instruments. Plays SFZ, Grand Orgu
 - Grand Orgue ODF format support (`.organ` files)
 - Kontakt 2 format support (`.nki` / `.nkm` files)
 - GIG format support (`.gig` files — RIFF/DLS with embedded PCM)
-- In-app instrument menu — press 1–9 to switch instruments live, R to rescan
-- MIDI file playback (press 1–9 on a `.mid` file)
+- In-app instrument menu — arrow keys + Enter to switch instruments, R to rescan
+- MIDI file playback (navigate to a `.mid` file and press Enter)
 - Parallel sample loading
 - Voice engine: up to 128 voices, Hermite cubic interpolation, looping, sustain pedal, release triggers
 - `note_polyphony` enforcement, `off_by` group muting, round-robin (`lorand`/`hirand`)
@@ -49,7 +49,7 @@ samples/
     └── instrument.gig
 ```
 
-Press **1–9** to load an instrument or play a MIDI file, **R** to rescan the samples directory, **Q** or **Ctrl+C** to quit.
+Use **↑/↓** to navigate, **Enter** to load an instrument or play a MIDI file, **R** to rescan the samples directory, **Q** or **Ctrl+C** to quit.
 
 ## SFZ support
 
@@ -125,9 +125,12 @@ Reads `.nki` (single program) and `.nkm` (multi-program bank) files. The binary 
 
 | File | Role |
 |------|------|
-| `src/main.rs` | Entry point: instrument discovery, JACK setup, terminal UI, MIDI file playback |
+| `src/main.rs` | Entry point: instrument discovery, JACK setup, input loop |
 | `src/instruments.rs` | `samples/` directory scanning (1–2 levels deep) |
-| `src/sampler.rs` | Real-time JACK voice engine |
+| `src/ui.rs` | Terminal menu rendering and playback state |
+| `src/audio.rs` | JACK process and notification handlers |
+| `src/loader.rs` | Parallel sample loading, WAV fixup, sample-rate probing |
+| `src/sampler.rs` | Real-time voice engine |
 | `src/midi.rs` | ALSA MIDI input thread (midir) |
 | `src/midi_player.rs` | MIDI file playback thread (midly) |
 | `src/sfz.rs` | SFZ parser with `#include`/`#define` expansion |
