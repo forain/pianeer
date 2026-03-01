@@ -1,14 +1,35 @@
-/// SFZ parser for the Salamander Grand Piano instrument.
+/// SFZ parser — handles SFZ v2 with ARIA extensions as used by the Salamander Grand Piano.
 ///
-/// Handles the opcodes actually present in the file:
-///   sample, lokey, hikey, lovel, hivel, pitch_keycenter,
-///   amp_veltrack, ampeg_release, volume, trigger, rt_decay,
-///   lorand, hirand, on_locc64, on_hicc64, group, off_by, pitch_keytrack, pan
-use std::path::Path;
+/// Features supported:
+///   #include (inline and line-start), #define macro expansion, default_path,
+///   <global>/<master>/<group>/<region> hierarchy, tune, sw_last/sw_lokey/sw_hikey/sw_default,
+///   locc$N/hicc$N, offset/offset_oncc$N, off_time, amplitude_oncc$N, pan_oncc$N,
+///   amp_veltrack_oncc$N, ampeg_release_oncc$N, set_cc$N, set_hdcc$N.
+use std::path::{Path, PathBuf};
 
 pub use crate::region::{Region, Trigger};
 
-/// Accumulates opcode state for a <group> header.
+/// Instrument-level metadata returned by the SFZ parser.
+pub struct SfzMeta {
+    /// Initial CC values from set_cc / set_hdcc directives in <control>.
+    pub cc_defaults: [u8; 128],
+    /// Keyswitch range low (inclusive). 0 if no keyswitch.
+    pub sw_lokey: u8,
+    /// Keyswitch range high (inclusive). 0 if no keyswitch (and sw_lokey==0 means disabled).
+    pub sw_hikey: u8,
+    /// Default active keyswitch note.
+    pub sw_default: Option<u8>,
+}
+
+impl Default for SfzMeta {
+    fn default() -> Self {
+        SfzMeta { cc_defaults: [0u8; 128], sw_lokey: 0, sw_hikey: 0, sw_default: None }
+    }
+}
+
+// ── GroupState ────────────────────────────────────────────────────────────────
+
+/// Inheritable opcode state for <global> / <master> / <group>.
 #[derive(Debug, Clone, Default)]
 struct GroupState {
     amp_veltrack: Option<f32>,
@@ -27,74 +48,163 @@ struct GroupState {
     lovel: Option<u8>,
     hivel: Option<u8>,
     note_polyphony: Option<u32>,
+    // SFZ v2 / ARIA
+    sw_last: Option<u8>,
+    sw_lokey: Option<u8>,
+    sw_hikey: Option<u8>,
+    sw_default: Option<u8>,
+    off_time: Option<f32>,
+    amplitude_oncc: Vec<(u8, f32)>,
+    pan_oncc: Vec<(u8, f32)>,
+    amp_veltrack_oncc: Vec<(u8, f32)>,
+    ampeg_release_oncc: Vec<(u8, f32)>,
+    cc_conds: Vec<(u8, u8, u8)>,
+    offset: Option<u64>,
+    offset_oncc: Option<(u8, u64)>,
 }
 
-/// Recursively expand `#include "file"` directives in SFZ content.
-/// Lines with `//` comments are stripped before checking for `#include`.
-/// Depth-limited to 8 levels.
+// ── #include expansion ────────────────────────────────────────────────────────
+
+/// Expand all `#include "file"` directives in `content`, including those embedded
+/// inline on the same line as other tokens (as used by the Salamander notes.txt).
+/// Lines with `//` comments are checked so that #include after `//` is ignored.
 fn expand_includes(content: &str, base_dir: &Path, depth: usize) -> Result<String, String> {
     if depth > 8 {
         return Err("SFZ #include depth limit exceeded".to_string());
     }
-    let mut result = String::new();
-    for line in content.lines() {
-        // Strip // comments to detect #include directives.
-        let stripped = if let Some(idx) = line.find("//") {
-            line[..idx].trim()
-        } else {
-            line.trim()
-        };
+    let mut result = String::with_capacity(content.len() + 64);
+    let mut pos = 0;
 
-        if let Some(rest) = stripped.strip_prefix("#include") {
-            let rest = rest.trim();
-            if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
-                let filename = &rest[1..rest.len() - 1];
-                let include_path = base_dir.join(filename.replace('\\', "/"));
-                let include_dir = include_path.parent().unwrap_or(base_dir);
-                let include_content = std::fs::read_to_string(&include_path)
-                    .map_err(|e| format!("Failed to read #include {:?}: {}", include_path, e))?;
-                let expanded = expand_includes(&include_content, include_dir, depth + 1)?;
-                result.push_str(&expanded);
-                result.push('\n');
-                continue;
+    while pos < content.len() {
+        match content[pos..].find("#include") {
+            None => {
+                result.push_str(&content[pos..]);
+                break;
+            }
+            Some(rel) => {
+                let abs = pos + rel;
+
+                // If the #include falls after a // comment on the same line, skip the line.
+                let line_start = content[..abs].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                if content[line_start..abs].contains("//") {
+                    let next_nl = content[abs..]
+                        .find('\n')
+                        .map(|p| abs + p + 1)
+                        .unwrap_or(content.len());
+                    result.push_str(&content[pos..next_nl]);
+                    pos = next_nl;
+                    continue;
+                }
+
+                result.push_str(&content[pos..abs]);
+                let after_kw = &content[abs + "#include".len()..];
+                let trimmed = after_kw.trim_start();
+                let trim_off = after_kw.len() - trimmed.len();
+
+                if trimmed.starts_with('"') {
+                    if let Some(end_q) = trimmed[1..].find('"') {
+                        let filename = &trimmed[1..end_q + 1];
+                        let inc_path = base_dir.join(filename.replace('\\', "/"));
+                        let inc_content = std::fs::read_to_string(&inc_path).map_err(|e| {
+                            format!("Failed to read #include {:?}: {}", inc_path, e)
+                        })?;
+                        // ARIA SFZ: all includes are resolved relative to the root SFZ
+                        // directory, not relative to the including file's own directory.
+                        let expanded = expand_includes(&inc_content, base_dir, depth + 1)?;
+                        // Surround with newlines so inline includes don't concatenate tokens.
+                        result.push('\n');
+                        result.push_str(&expanded);
+                        result.push('\n');
+                        pos = abs + "#include".len() + trim_off + 1 + end_q + 1;
+                        continue;
+                    }
+                }
+                // Unparseable #include — emit literally and advance past keyword.
+                result.push_str("#include");
+                pos = abs + "#include".len();
             }
         }
-        result.push_str(line);
-        result.push('\n');
     }
     Ok(result)
 }
 
-pub fn parse_sfz(sfz_path: &Path) -> Result<Vec<Region>, String> {
+// ── #define expansion ─────────────────────────────────────────────────────────
+
+/// Process `#define $NAME value` directives inline (ARIA extension).
+/// Each #define applies from its position downward (handles redefinition per group).
+/// #define lines are removed from the output.
+fn expand_defines(content: &str) -> String {
+    let mut macros: Vec<(String, String)> = Vec::new();
+    let mut result = String::with_capacity(content.len());
+
+    for line in content.lines() {
+        let effective = if let Some(idx) = line.find("//") { &line[..idx] } else { line }.trim();
+
+        if let Some(rest) = effective.strip_prefix("#define") {
+            let rest = rest.trim_start();
+            if let Some(ws) = rest.find(char::is_whitespace) {
+                let name = rest[..ws].to_string();
+                let value = rest[ws..].trim().to_string();
+                // Update existing or add new entry.
+                if let Some(entry) = macros.iter_mut().find(|(n, _)| n == &name) {
+                    entry.1 = value;
+                } else {
+                    macros.push((name, value));
+                }
+                // Don't emit #define lines.
+                continue;
+            }
+        }
+
+        // Apply current macro map to this line.
+        // Sort by name length descending so longer names match before shorter prefixes.
+        if macros.is_empty() {
+            result.push_str(line);
+        } else {
+            let mut sorted: Vec<_> = macros.iter().collect();
+            sorted.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+            let mut processed = line.to_string();
+            for (name, value) in sorted {
+                processed = processed.replace(name.as_str(), value.as_str());
+            }
+            result.push_str(&processed);
+        }
+        result.push('\n');
+    }
+    result
+}
+
+// ── Public parse entry point ──────────────────────────────────────────────────
+
+pub fn parse_sfz(sfz_path: &Path) -> Result<(Vec<Region>, SfzMeta), String> {
     let raw = std::fs::read_to_string(sfz_path)
         .map_err(|e| format!("Failed to read SFZ: {}", e))?;
 
     let base_dir = sfz_path.parent().unwrap_or(Path::new("."));
 
-    let content = expand_includes(&raw, base_dir, 0)
+    let included = expand_includes(&raw, base_dir, 0)
         .map_err(|e| format!("SFZ include error: {}", e))?;
+    let content = expand_defines(&included);
 
     let mut regions = Vec::new();
     let mut global = GroupState::default();
     let mut group = GroupState::default();
     let mut in_region = false;
     let mut in_global = false;
+    let mut in_control = false;
     let mut current_region = Region::default();
+    let mut default_path = PathBuf::new();
+    let mut cc_defaults = [0u8; 128];
 
     for line in content.lines() {
-        // Strip line comments (// style)
-        let line = if let Some(idx) = line.find("//") {
-            &line[..idx]
-        } else {
-            line
-        };
+        // Strip line comments.
+        let line = if let Some(idx) = line.find("//") { &line[..idx] } else { line };
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
 
-        // Tokenise: split on whitespace but handle <header> tokens
-        // mixed with opcode=value tokens on the same line.
+        // Tokenise: handle <header> and opcode=value tokens.
         let mut tokens: Vec<&str> = Vec::new();
         let mut rest = line;
         while !rest.is_empty() {
@@ -124,26 +234,27 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<Vec<Region>, String> {
                         }
                         global = GroupState::default();
                         in_global = true;
+                        in_control = false;
                     }
-                    // <master> sits between <global> and <group> in the SFZ v2
-                    // hierarchy. Inherit from global; group will inherit from it.
                     "master" => {
                         if in_region {
                             regions.push(current_region.clone());
                             in_region = false;
                         }
+                        // master inherits global; group-level opcodes override.
                         group = global.clone();
                         in_global = false;
+                        in_control = false;
                     }
                     "group" => {
                         if in_region {
                             regions.push(current_region.clone());
                             in_region = false;
                         }
-                        // Inherit global defaults; group-level opcodes will override.
                         group = global.clone();
                         current_region = Region::default();
                         in_global = false;
+                        in_control = false;
                     }
                     "region" => {
                         if in_region {
@@ -152,9 +263,14 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<Vec<Region>, String> {
                         current_region = region_from_group(&group);
                         in_region = true;
                         in_global = false;
+                        in_control = false;
                     }
-                    // <control> contains set_cc / label_cc — no audio impact, skip.
                     "control" => {
+                        if in_region {
+                            regions.push(current_region.clone());
+                            in_region = false;
+                        }
+                        in_control = true;
                         in_global = false;
                     }
                     _ => {}
@@ -163,8 +279,10 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<Vec<Region>, String> {
                 let key = &token[..eq_pos];
                 let val = &token[eq_pos + 1..];
 
-                if in_region {
-                    apply_opcode_to_region(&mut current_region, key, val, base_dir);
+                if in_control {
+                    apply_opcode_to_control(key, val, &mut default_path, &mut cc_defaults);
+                } else if in_region {
+                    apply_opcode_to_region(&mut current_region, key, val, base_dir, &default_path);
                 } else if in_global {
                     apply_opcode_to_group(&mut global, key, val);
                 } else {
@@ -178,8 +296,43 @@ pub fn parse_sfz(sfz_path: &Path) -> Result<Vec<Region>, String> {
         regions.push(current_region);
     }
 
-    Ok(regions)
+    let meta = SfzMeta {
+        cc_defaults,
+        sw_lokey: global.sw_lokey.unwrap_or(0),
+        sw_hikey: global.sw_hikey.unwrap_or(0),
+        sw_default: global.sw_default,
+    };
+
+    Ok((regions, meta))
 }
+
+// ── <control> opcode handler ──────────────────────────────────────────────────
+
+fn apply_opcode_to_control(
+    key: &str,
+    val: &str,
+    default_path: &mut PathBuf,
+    cc_defaults: &mut [u8; 128],
+) {
+    if key == "default_path" {
+        *default_path = PathBuf::from(val.replace('\\', "/"));
+    } else if let Some(cc_str) = key.strip_prefix("set_hdcc") {
+        if let (Ok(cc_num), Ok(v)) = (cc_str.parse::<usize>(), val.parse::<f32>()) {
+            if cc_num < 128 {
+                cc_defaults[cc_num] = (v * 127.0).round().clamp(0.0, 127.0) as u8;
+            }
+        }
+    } else if let Some(cc_str) = key.strip_prefix("set_cc") {
+        if let (Ok(cc_num), Ok(v)) = (cc_str.parse::<usize>(), val.parse::<u8>()) {
+            if cc_num < 128 {
+                cc_defaults[cc_num] = v;
+            }
+        }
+    }
+    // label_cc, set_hd*cc (ARIA half-double variants) and other control opcodes are cosmetic.
+}
+
+// ── region_from_group ─────────────────────────────────────────────────────────
 
 fn region_from_group(g: &GroupState) -> Region {
     let mut r = Region::default();
@@ -199,8 +352,19 @@ fn region_from_group(g: &GroupState) -> Region {
     if let Some(v) = g.lovel { r.lovel = v; }
     if let Some(v) = g.hivel { r.hivel = v; }
     r.note_polyphony = g.note_polyphony;
+    r.sw_last = g.sw_last;
+    if let Some(v) = g.off_time { r.off_time = v; }
+    if let Some(v) = g.offset { r.offset = v; }
+    r.offset_oncc = g.offset_oncc;
+    r.amplitude_oncc = g.amplitude_oncc.clone();
+    r.pan_oncc = g.pan_oncc.clone();
+    r.amp_veltrack_oncc = g.amp_veltrack_oncc.clone();
+    r.ampeg_release_oncc = g.ampeg_release_oncc.clone();
+    r.cc_conds = g.cc_conds.clone();
     r
 }
+
+// ── apply_opcode_to_group ─────────────────────────────────────────────────────
 
 fn apply_opcode_to_group(g: &mut GroupState, key: &str, val: &str) {
     match key {
@@ -220,36 +384,130 @@ fn apply_opcode_to_group(g: &mut GroupState, key: &str, val: &str) {
         "lovel" => g.lovel = val.parse().ok(),
         "hivel" => g.hivel = val.parse().ok(),
         "note_polyphony" => g.note_polyphony = val.parse().ok(),
-        _ => {}
+        "sw_last" => g.sw_last = parse_key(val),
+        "sw_lokey" => g.sw_lokey = parse_key(val),
+        "sw_hikey" => g.sw_hikey = parse_key(val),
+        "sw_default" => g.sw_default = parse_key(val),
+        "off_time" => g.off_time = val.parse().ok(),
+        "offset" => g.offset = val.parse().ok(),
+        _ => {
+            if let Some(v) = parse_oncc_val(key, val, "amplitude_oncc") {
+                set_cc_mod(&mut g.amplitude_oncc, v.0, v.1);
+            } else if let Some(v) = parse_oncc_val(key, val, "pan_oncc") {
+                set_cc_mod(&mut g.pan_oncc, v.0, v.1);
+            } else if let Some(v) = parse_oncc_val(key, val, "amp_veltrack_oncc") {
+                set_cc_mod(&mut g.amp_veltrack_oncc, v.0, v.1);
+            } else if let Some(v) = parse_oncc_val(key, val, "ampeg_release_oncc") {
+                set_cc_mod(&mut g.ampeg_release_oncc, v.0, v.1);
+            } else if let Some(v) = parse_oncc_val(key, val, "offset_oncc") {
+                g.offset_oncc = Some((v.0, v.1 as u64));
+            } else {
+                parse_cc_cond(key, val, &mut g.cc_conds);
+            }
+        }
     }
 }
 
-fn apply_opcode_to_region(r: &mut Region, key: &str, val: &str, base_dir: &Path) {
+// ── apply_opcode_to_region ────────────────────────────────────────────────────
+
+fn apply_opcode_to_region(
+    r: &mut Region,
+    key: &str,
+    val: &str,
+    base_dir: &Path,
+    default_path: &Path,
+) {
     match key {
         "sample" => {
             let normalized = val.replace('\\', "/");
-            r.sample = base_dir.join(&normalized);
+            r.sample = base_dir.join(default_path).join(&normalized);
         }
         "lokey" => { if let Some(v) = parse_key(val) { r.lokey = v; } }
         "hikey" => { if let Some(v) = parse_key(val) { r.hikey = v; } }
-        "lovel" => { if let Some(v) = val.parse().ok() { r.lovel = v; } }
-        "hivel" => { if let Some(v) = val.parse().ok() { r.hivel = v; } }
+        "key" => {
+            // Shorthand: sets lokey = hikey = pitch_keycenter.
+            if let Some(v) = parse_key(val) {
+                r.lokey = v;
+                r.hikey = v;
+                r.pitch_keycenter = v;
+            }
+        }
+        "lovel" => { if let Ok(v) = val.parse() { r.lovel = v; } }
+        "hivel" => { if let Ok(v) = val.parse() { r.hivel = v; } }
         "pitch_keycenter" => { if let Some(v) = parse_key(val) { r.pitch_keycenter = v; } }
-        "amp_veltrack" => { if let Some(v) = val.parse().ok() { r.amp_veltrack = v; } }
-        "ampeg_release" => { if let Some(v) = val.parse().ok() { r.ampeg_release = v; } }
-        "volume" => { if let Some(v) = val.parse().ok() { r.volume = v; } }
+        "amp_veltrack" => { if let Ok(v) = val.parse() { r.amp_veltrack = v; } }
+        "ampeg_release" => { if let Ok(v) = val.parse() { r.ampeg_release = v; } }
+        "volume" => { if let Ok(v) = val.parse() { r.volume = v; } }
         "trigger" => { if let Some(v) = parse_trigger(val) { r.trigger = v; } }
-        "rt_decay" => { if let Some(v) = val.parse().ok() { r.rt_decay = v; } }
-        "lorand" => { if let Some(v) = val.parse().ok() { r.lorand = v; } }
-        "hirand" => { if let Some(v) = val.parse().ok() { r.hirand = v; } }
+        "rt_decay" => { if let Ok(v) = val.parse() { r.rt_decay = v; } }
+        "lorand" => { if let Ok(v) = val.parse() { r.lorand = v; } }
+        "hirand" => { if let Ok(v) = val.parse() { r.hirand = v; } }
         "on_locc64" => r.on_locc64 = val.parse().ok(),
         "on_hicc64" => r.on_hicc64 = val.parse().ok(),
         "group" => r.group = val.parse().ok(),
         "off_by" => r.off_by = val.parse().ok(),
-        "pitch_keytrack" => { if let Some(v) = val.parse().ok() { r.pitch_keytrack = v; } }
+        "pitch_keytrack" => { if let Ok(v) = val.parse() { r.pitch_keytrack = v; } }
         "pan" => { if let Ok(v) = val.parse() { r.pan = v; } }
+        "tune" => { if let Ok(v) = val.parse() { r.tune_cents = v; } }
         "note_polyphony" => r.note_polyphony = val.parse().ok(),
-        _ => {}
+        "sw_last" => r.sw_last = parse_key(val),
+        "off_time" => { if let Ok(v) = val.parse() { r.off_time = v; } }
+        "offset" => { if let Ok(v) = val.parse() { r.offset = v; } }
+        _ => {
+            if let Some(v) = parse_oncc_val(key, val, "amplitude_oncc") {
+                set_cc_mod(&mut r.amplitude_oncc, v.0, v.1);
+            } else if let Some(v) = parse_oncc_val(key, val, "pan_oncc") {
+                set_cc_mod(&mut r.pan_oncc, v.0, v.1);
+            } else if let Some(v) = parse_oncc_val(key, val, "amp_veltrack_oncc") {
+                set_cc_mod(&mut r.amp_veltrack_oncc, v.0, v.1);
+            } else if let Some(v) = parse_oncc_val(key, val, "ampeg_release_oncc") {
+                set_cc_mod(&mut r.ampeg_release_oncc, v.0, v.1);
+            } else if let Some(v) = parse_oncc_val(key, val, "offset_oncc") {
+                r.offset_oncc = Some((v.0, v.1 as u64));
+            } else {
+                parse_cc_cond(key, val, &mut r.cc_conds);
+            }
+        }
+    }
+}
+
+// ── Helper parsers ────────────────────────────────────────────────────────────
+
+/// Parse `prefix$N=value` style opcodes. Returns (cc_num, value) on success.
+fn parse_oncc_val(key: &str, val: &str, prefix: &str) -> Option<(u8, f32)> {
+    let cc_str = key.strip_prefix(prefix)?;
+    let cc_num: u8 = cc_str.parse().ok()?;
+    let v: f32 = val.parse().ok()?;
+    Some((cc_num, v))
+}
+
+/// Parse `locc$N` / `hicc$N` and insert/update a condition in `conds`.
+fn parse_cc_cond(key: &str, val: &str, conds: &mut Vec<(u8, u8, u8)>) {
+    let (is_lo, cc_str) = if let Some(s) = key.strip_prefix("locc") {
+        (true, s)
+    } else if let Some(s) = key.strip_prefix("hicc") {
+        (false, s)
+    } else {
+        return;
+    };
+    let cc_num: u8 = match cc_str.parse() { Ok(v) => v, Err(_) => return };
+    let cc_val: u8 = match val.parse() { Ok(v) => v, Err(_) => return };
+
+    if let Some(entry) = conds.iter_mut().find(|(c, _, _)| *c == cc_num) {
+        if is_lo { entry.1 = cc_val; } else { entry.2 = cc_val; }
+    } else if is_lo {
+        conds.push((cc_num, cc_val, 127));
+    } else {
+        conds.push((cc_num, 0, cc_val));
+    }
+}
+
+/// Update or insert a (cc_num, value) entry in a CC-mod list.
+fn set_cc_mod(list: &mut Vec<(u8, f32)>, cc: u8, val: f32) {
+    if let Some(entry) = list.iter_mut().find(|(c, _)| *c == cc) {
+        entry.1 = val;
+    } else {
+        list.push((cc, val));
     }
 }
 
@@ -273,14 +531,8 @@ fn parse_key(val: &str) -> Option<u8> {
     let mut chars = val.chars().peekable();
     let note_char = chars.next()?.to_ascii_uppercase();
     let base: i32 = match note_char {
-        'C' => 0,
-        'D' => 2,
-        'E' => 4,
-        'F' => 5,
-        'G' => 7,
-        'A' => 9,
-        'B' => 11,
-        _ => return None,
+        'C' => 0, 'D' => 2, 'E' => 4, 'F' => 5,
+        'G' => 7, 'A' => 9, 'B' => 11, _ => return None,
     };
     let accidental = match chars.peek() {
         Some('#') => { chars.next(); 1 }

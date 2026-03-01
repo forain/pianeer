@@ -58,6 +58,30 @@ pub struct Region {
     pub loop_end: Option<u64>,
     /// Maximum simultaneous voices for the same MIDI note (None = unlimited).
     pub note_polyphony: Option<u32>,
+
+    // ── SFZ v2 / ARIA extensions ──────────────────────────────────────────────
+
+    /// Keyswitch note that activates this region (sw_last). None = always active.
+    pub sw_last: Option<u8>,
+    /// CC range conditions for this region: (cc_num, lo, hi).
+    /// Region only plays if all conditions hold against current CC values.
+    pub cc_conds: Vec<(u8, u8, u8)>,
+    /// Fixed sample start offset in frames.
+    pub offset: u64,
+    /// CC-controlled start offset: (cc_num, max_frames). Adds cc/127 * max to offset.
+    pub offset_oncc: Option<(u8, u64)>,
+    /// Voice fade-out time (seconds) when killed by off_by group exclusion.
+    pub off_time: f32,
+    /// CC-modulated amplitude additions: (cc_num, max_pct).
+    /// effective_amplitude_pct = 100 + Σ(cc/127 * max_pct)
+    pub amplitude_oncc: Vec<(u8, f32)>,
+    /// CC-modulated pan additions using center-pan curve: (cc_num, max_delta).
+    /// Contribution = (cc/64 − 1) * max_delta, so CC=64 → 0, CC=0 → −max, CC=127 → +max.
+    pub pan_oncc: Vec<(u8, f32)>,
+    /// CC-modulated amp_veltrack additions: (cc_num, max_mod).
+    pub amp_veltrack_oncc: Vec<(u8, f32)>,
+    /// CC-modulated ampeg_release additions: (cc_num, max_add_seconds).
+    pub ampeg_release_oncc: Vec<(u8, f32)>,
 }
 
 impl Default for Region {
@@ -86,6 +110,15 @@ impl Default for Region {
             loop_start: None,
             loop_end: None,
             note_polyphony: None,
+            sw_last: None,
+            cc_conds: Vec::new(),
+            offset: 0,
+            offset_oncc: None,
+            off_time: 0.01,
+            amplitude_oncc: Vec::new(),
+            pan_oncc: Vec::new(),
+            amp_veltrack_oncc: Vec::new(),
+            ampeg_release_oncc: Vec::new(),
         }
     }
 }

@@ -69,6 +69,8 @@ struct Voice {
     pan_l: f32,
     /// Equal-power pan gain for right channel.
     pan_r: f32,
+    /// Fade-out time (seconds) when killed by group exclusion (off_time).
+    off_time: f32,
 }
 
 pub struct SamplerState {
@@ -80,6 +82,14 @@ pub struct SamplerState {
     midi_rx: Receiver<MidiEvent>,
     /// Cumulative frame counter, incremented at the start of each process() call.
     frame_count: u64,
+    /// Current MIDI CC values (updated on every ControlChange event).
+    cc_values: [u8; 128],
+    /// Active keyswitch note (None = default / no keyswitch used yet).
+    active_keyswitch: Option<u8>,
+    /// Keyswitch range low (inclusive). When sw_lokey > sw_hikey, keyswitches are disabled.
+    sw_lokey: u8,
+    /// Keyswitch range high (inclusive).
+    sw_hikey: u8,
 }
 
 impl SamplerState {
@@ -88,6 +98,10 @@ impl SamplerState {
         samples: Vec<Option<LoadedSample>>,
         sample_rate: f64,
         midi_rx: Receiver<MidiEvent>,
+        cc_defaults: [u8; 128],
+        sw_lokey: u8,
+        sw_hikey: u8,
+        sw_default: Option<u8>,
     ) -> Self {
         SamplerState {
             regions,
@@ -97,6 +111,10 @@ impl SamplerState {
             sample_rate,
             midi_rx,
             frame_count: 0,
+            cc_values: cc_defaults,
+            active_keyswitch: sw_default,
+            sw_lokey,
+            sw_hikey,
         }
     }
 
@@ -217,10 +235,12 @@ impl SamplerState {
             MidiEvent::NoteOff { note, .. } => {
                 self.note_off(note);
             }
-            MidiEvent::ControlChange { controller: 64, value, .. } => {
-                self.set_sustain(value >= 64);
+            MidiEvent::ControlChange { controller, value, .. } => {
+                self.cc_values[controller as usize] = value;
+                if controller == 64 {
+                    self.set_sustain(value >= 64);
+                }
             }
-            MidiEvent::ControlChange { .. } => {}
             MidiEvent::AllNotesOff => {
                 self.all_notes_off();
             }
@@ -228,6 +248,15 @@ impl SamplerState {
     }
 
     fn note_on(&mut self, note: u8, velocity: u8) {
+        // Keyswitch: if note is in the keyswitch range, update active keyswitch and return.
+        if self.sw_lokey <= self.sw_hikey
+            && note >= self.sw_lokey
+            && note <= self.sw_hikey
+        {
+            self.active_keyswitch = Some(note);
+            return;
+        }
+
         let rand_val: f32 = rand_f32();
 
         let mut to_spawn: Vec<(usize, u32)> = Vec::new();
@@ -248,6 +277,16 @@ impl SamplerState {
                 if region.hirand < 1.0 || rand_val < region.lorand {
                     continue;
                 }
+            }
+            // Keyswitch filter: region only active when its sw_last matches.
+            if let Some(sw) = region.sw_last {
+                if self.active_keyswitch != Some(sw) {
+                    continue;
+                }
+            }
+            // CC condition filter.
+            if !cc_conds_met(&region.cc_conds, &self.cc_values) {
+                continue;
             }
             to_spawn.push((idx, region.group.unwrap_or(0)));
         }
@@ -307,6 +346,14 @@ impl SamplerState {
                 continue;
             }
             if region.hirand < 1.0 && rand_val >= region.hirand {
+                continue;
+            }
+            if let Some(sw) = region.sw_last {
+                if self.active_keyswitch != Some(sw) {
+                    continue;
+                }
+            }
+            if !cc_conds_met(&region.cc_conds, &self.cc_values) {
                 continue;
             }
             release_regions.push(idx);
@@ -396,12 +443,14 @@ impl SamplerState {
     }
 
     fn kill_group(&mut self, group: u32) {
+        let sr = self.sample_rate;
         for slot in self.voices.iter_mut() {
             if let Some(ref mut v) = slot {
                 if v.group == Some(group) {
+                    let fade = (v.off_time as f64).max(0.005);
                     v.envelope = EnvelopeState::Releasing {
                         amplitude: 1.0,
-                        decay_per_sample: decay_per_sample(0.01, self.sample_rate),
+                        decay_per_sample: decay_per_sample(fade, sr),
                     };
                 }
             }
@@ -438,24 +487,33 @@ impl SamplerState {
     }
 
     fn spawn_voice(&mut self, region_idx: usize, note: u8, velocity: u8, is_release_trigger: bool) {
-        let (playback_rate, amplitude, release_time, group, off_by, pan_l, pan_r) = {
+        let cc = &self.cc_values;
+        let (playback_rate, amplitude, release_time, group, off_by, pan_l, pan_r, start_pos, off_time) = {
             let region = &self.regions[region_idx];
-            let angle = std::f32::consts::FRAC_PI_4 * (region.pan / 100.0 + 1.0);
+            let eff_veltrack = effective_veltrack(region, cc);
+            let eff_amp = compute_amplitude(velocity, region, eff_veltrack)
+                * amplitude_multiplier(region, cc);
+            let eff_pan = effective_pan(region, cc);
+            let eff_release = effective_release(region, cc).max(0.001);
+            let start = effective_offset(region, cc);
+            let angle = std::f32::consts::FRAC_PI_4 * (eff_pan / 100.0 + 1.0);
             (
                 compute_playback_rate(note, region),
-                compute_amplitude(velocity, region),
-                region.ampeg_release.max(0.001),
+                eff_amp,
+                eff_release,
                 region.group,
                 region.off_by,
                 angle.cos(),
                 angle.sin(),
+                start as f64,
+                region.off_time,
             )
         };
 
         let slot_idx = self.find_free_voice();
         self.voices[slot_idx] = Some(Voice {
             region_idx,
-            position: 0.0,
+            position: start_pos,
             playback_rate,
             amplitude,
             envelope: EnvelopeState::Sustaining,
@@ -469,22 +527,30 @@ impl SamplerState {
             started_at: self.frame_count,
             pan_l,
             pan_r,
+            off_time,
         });
     }
 
     fn spawn_release_voice(&mut self, region_idx: usize, note: u8, velocity: u8, held_secs: f32) {
-        let (playback_rate, mut amplitude, release_time, group, off_by, rt_decay, pan_l, pan_r) = {
+        let cc = &self.cc_values;
+        let (playback_rate, mut amplitude, release_time, group, off_by, rt_decay, pan_l, pan_r, off_time) = {
             let region = &self.regions[region_idx];
-            let angle = std::f32::consts::FRAC_PI_4 * (region.pan / 100.0 + 1.0);
+            let eff_veltrack = effective_veltrack(region, cc);
+            let eff_amp = compute_amplitude(velocity, region, eff_veltrack)
+                * amplitude_multiplier(region, cc);
+            let eff_pan = effective_pan(region, cc);
+            let eff_release = effective_release(region, cc).max(0.1);
+            let angle = std::f32::consts::FRAC_PI_4 * (eff_pan / 100.0 + 1.0);
             (
                 compute_playback_rate(note, region),
-                compute_amplitude(velocity, region),
-                region.ampeg_release.max(0.1),
+                eff_amp,
+                eff_release,
                 region.group,
                 region.off_by,
                 region.rt_decay,
                 angle.cos(),
                 angle.sin(),
+                region.off_time,
             )
         };
 
@@ -509,6 +575,7 @@ impl SamplerState {
             started_at: self.frame_count,
             pan_l,
             pan_r,
+            off_time,
         });
     }
 
@@ -517,16 +584,94 @@ impl SamplerState {
     }
 
     /// Replace the loaded instrument without restarting JACK.
-    /// Clears all active voices and resets the sustain pedal.
-    pub fn swap_instrument(&mut self, regions: Vec<Region>, samples: Vec<Option<LoadedSample>>) {
+    /// Clears all active voices and resets the sustain pedal and CC/keyswitch state.
+    pub fn swap_instrument(
+        &mut self,
+        regions: Vec<Region>,
+        samples: Vec<Option<LoadedSample>>,
+        cc_defaults: [u8; 128],
+        sw_lokey: u8,
+        sw_hikey: u8,
+        sw_default: Option<u8>,
+    ) {
         for slot in self.voices.iter_mut() {
             *slot = None;
         }
         self.regions = regions;
         self.samples = samples;
         self.sustain_pedal = false;
+        self.cc_values = cc_defaults;
+        self.sw_lokey = sw_lokey;
+        self.sw_hikey = sw_hikey;
+        self.active_keyswitch = sw_default;
     }
 }
+
+// ── CC condition check ────────────────────────────────────────────────────────
+
+#[inline]
+fn cc_conds_met(conds: &[(u8, u8, u8)], cc: &[u8; 128]) -> bool {
+    conds.iter().all(|&(cc_num, lo, hi)| {
+        let v = cc[cc_num as usize];
+        v >= lo && v <= hi
+    })
+}
+
+// ── CC-modulated parameter helpers ───────────────────────────────────────────
+
+/// Effective amplitude multiplier: 1.0 + Σ(cc/127 * max_pct/100).
+#[inline]
+fn amplitude_multiplier(region: &Region, cc: &[u8; 128]) -> f32 {
+    if region.amplitude_oncc.is_empty() {
+        return 1.0;
+    }
+    let mut pct = 100.0f32;
+    for &(cc_num, max_pct) in &region.amplitude_oncc {
+        pct += cc[cc_num as usize] as f32 / 127.0 * max_pct;
+    }
+    (pct / 100.0).max(0.0)
+}
+
+/// Effective pan with CC contributions using center-pan curve (CC=64 → no change).
+#[inline]
+fn effective_pan(region: &Region, cc: &[u8; 128]) -> f32 {
+    let mut pan = region.pan;
+    for &(cc_num, max_delta) in &region.pan_oncc {
+        pan += (cc[cc_num as usize] as f32 / 64.0 - 1.0) * max_delta;
+    }
+    pan.clamp(-100.0, 100.0)
+}
+
+/// Effective amp_veltrack with CC contributions.
+#[inline]
+fn effective_veltrack(region: &Region, cc: &[u8; 128]) -> f32 {
+    let mut vt = region.amp_veltrack;
+    for &(cc_num, max_mod) in &region.amp_veltrack_oncc {
+        vt += cc[cc_num as usize] as f32 / 127.0 * max_mod;
+    }
+    vt.clamp(0.0, 200.0)
+}
+
+/// Effective ampeg_release with CC additions.
+#[inline]
+fn effective_release(region: &Region, cc: &[u8; 128]) -> f32 {
+    let mut rel = region.ampeg_release;
+    for &(cc_num, max_add) in &region.ampeg_release_oncc {
+        rel += cc[cc_num as usize] as f32 / 127.0 * max_add;
+    }
+    rel
+}
+
+/// Effective sample start offset: fixed offset + CC-controlled addition.
+#[inline]
+fn effective_offset(region: &Region, cc: &[u8; 128]) -> u64 {
+    let cc_add = region.offset_oncc.map_or(0u64, |(cc_num, max_off)| {
+        (cc[cc_num as usize] as u64 * max_off) / 127
+    });
+    region.offset + cc_add
+}
+
+// ── Audio helpers ─────────────────────────────────────────────────────────────
 
 /// Catmull-Rom / Hermite cubic interpolation between p1 and p2.
 /// p0 and p3 are the surrounding control points; t in [0, 1).
@@ -564,9 +709,9 @@ fn compute_playback_rate(note: u8, region: &Region) -> f64 {
     2.0_f64.powf(semitones / 12.0)
 }
 
-fn compute_amplitude(velocity: u8, region: &Region) -> f32 {
+fn compute_amplitude(velocity: u8, region: &Region, veltrack: f32) -> f32 {
     let vel_norm = velocity as f32 / 127.0;
-    let vel_gain = vel_norm.powf(region.amp_veltrack / 100.0);
+    let vel_gain = vel_norm.powf(veltrack / 100.0);
     let linear_gain = 10.0_f32.powf(region.volume / 20.0);
     vel_gain * linear_gain
 }

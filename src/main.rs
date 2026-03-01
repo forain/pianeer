@@ -255,27 +255,40 @@ fn load_all_samples_parallel(regions: &[Region]) -> Vec<Option<LoadedSample>> {
 
 // ─── Instrument loading ───────────────────────────────────────────────────────
 
-fn load_instrument_data(inst: &Instrument) -> Result<(Vec<Region>, Vec<Option<LoadedSample>>), String> {
+struct LoadedInstrument {
+    regions: Vec<Region>,
+    samples: Vec<Option<LoadedSample>>,
+    cc_defaults: [u8; 128],
+    sw_lokey: u8,
+    sw_hikey: u8,
+    sw_default: Option<u8>,
+}
+
+fn load_instrument_data(inst: &Instrument) -> Result<LoadedInstrument, String> {
     let ext = inst.path.extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let regions = match ext.as_str() {
+    let (regions, cc_defaults, sw_lokey, sw_hikey, sw_default) = match ext.as_str() {
         "sfz" => {
             println!("Parsing SFZ: {}", inst.path.display());
-            sfz::parse_sfz(&inst.path).map_err(|e| format!("Error parsing SFZ: {}", e))?
+            let (regions, meta) = sfz::parse_sfz(&inst.path)
+                .map_err(|e| format!("Error parsing SFZ: {}", e))?;
+            (regions, meta.cc_defaults, meta.sw_lokey, meta.sw_hikey, meta.sw_default)
         }
         "organ" => {
             println!("Parsing Grand Orgue ODF: {}", inst.path.display());
-            organ::parse_organ(&inst.path).map_err(|e| format!("Error parsing ODF: {}", e))?
+            let regions = organ::parse_organ(&inst.path)
+                .map_err(|e| format!("Error parsing ODF: {}", e))?;
+            (regions, [0u8; 128], 0u8, 0u8, None)
         }
         other => return Err(format!("Unknown file extension '{}'", other)),
     };
     println!("Parsed {} regions.", regions.len());
     let samples = load_all_samples_parallel(&regions);
     println!("All samples loaded.");
-    Ok((regions, samples))
+    Ok(LoadedInstrument { regions, samples, cc_defaults, sw_lokey, sw_hikey, sw_default })
 }
 
 // ─── Menu display ─────────────────────────────────────────────────────────────
@@ -342,10 +355,15 @@ fn main() {
     let first_inst = menu.iter().find_map(|m| {
         if let MenuItem::Instrument(i) = m { Some(i) } else { None }
     }).unwrap(); // guaranteed: raw_instruments was non-empty
-    let (regions, samples) = match load_instrument_data(first_inst) {
+    let first_loaded = match load_instrument_data(first_inst) {
         Ok(data) => data,
         Err(e) => { eprintln!("{}", e); std::process::exit(1); }
     };
+    let (regions, samples, first_cc, first_sw_lo, first_sw_hi, first_sw_def) = (
+        first_loaded.regions, first_loaded.samples,
+        first_loaded.cc_defaults, first_loaded.sw_lokey,
+        first_loaded.sw_hikey, first_loaded.sw_default,
+    );
 
     // 4. Probe sample rate from the first region's sample file.
     let probed_rate: Option<u32> = regions.iter()
@@ -399,6 +417,10 @@ fn main() {
         samples,
         sample_rate,
         midi_rx,
+        first_cc,
+        first_sw_lo,
+        first_sw_hi,
+        first_sw_def,
     )));
 
     // 9. Start MIDI input thread.
@@ -530,9 +552,13 @@ fn main() {
                     terminal::disable_raw_mode().ok();
                     println!("\r\nLoading {}...", inst.name);
                     match load_instrument_data(inst) {
-                        Ok((regions, samples)) => {
+                        Ok(loaded) => {
                             if let Ok(ref mut s) = state.lock() {
-                                s.swap_instrument(regions, samples);
+                                s.swap_instrument(
+                                    loaded.regions, loaded.samples,
+                                    loaded.cc_defaults,
+                                    loaded.sw_lokey, loaded.sw_hikey, loaded.sw_default,
+                                );
                             }
                             current = idx;
                         }

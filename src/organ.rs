@@ -152,6 +152,7 @@ fn attack_region(
         loop_start,
         loop_end,
         note_polyphony: None,
+        ..Region::default()
     }
 }
 
@@ -180,6 +181,7 @@ fn release_region(sample: PathBuf, midi_note: u8, volume_db: f32, tune_cents: f3
         loop_start: None,
         loop_end: None,
         note_polyphony: None,
+        ..Region::default()
     }
 }
 
