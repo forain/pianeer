@@ -1,7 +1,7 @@
 //! MIDI file discovery and playback.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 
 use crate::sampler::MidiEvent;
+
+/// Sentinel: no seek pending.
+const NO_SEEK: u64 = u64::MAX;
 
 // ─── Discovery ────────────────────────────────────────────────────────────────
 
@@ -54,23 +57,41 @@ pub fn discover(dir: &Path) -> Vec<(String, PathBuf)> {
 
 // ─── Playback ─────────────────────────────────────────────────────────────────
 
-/// Spawn a thread that plays `path` through `midi_tx`.
+/// Spawn a playback thread.
 ///
-/// Set `stop` to abort early. `done` is set to `true` when the thread exits
-/// (naturally or via stop). `AllNotesOff` is always sent on exit.
+/// Returns `(handle, total_duration_us)`.  The MIDI file is pre-parsed on the
+/// calling thread so `total_duration_us` is available immediately.
+///
+/// * `stop`       – set to abort; `AllNotesOff` is sent on exit.
+/// * `done`       – set when the thread exits.
+/// * `paused`     – set to pause, clear to resume.
+/// * `current_us` – updated ~every 10 ms with the playback position.
+/// * `seek_to`    – write a position in µs to seek; use NO_SEEK sentinel otherwise.
 pub fn spawn(
     path: PathBuf,
     midi_tx: Sender<MidiEvent>,
     stop: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
-        if let Err(e) = play(&path, &midi_tx, &stop) {
-            eprintln!("MIDI playback error: {}", e);
+    paused: Arc<AtomicBool>,
+    current_us: Arc<AtomicU64>,
+    seek_to: Arc<AtomicU64>,
+) -> (JoinHandle<()>, u64) {
+    let (timed, total_us) = match parse_file(&path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("MIDI parse error: {}", e);
+            done.store(true, Ordering::Relaxed);
+            return (thread::spawn(|| {}), 0);
         }
+    };
+
+    let handle = thread::spawn(move || {
+        play_events(timed, &midi_tx, &stop, &paused, &current_us, &seek_to);
         let _ = midi_tx.send(MidiEvent::AllNotesOff);
         done.store(true, Ordering::Relaxed);
-    })
+    });
+
+    (handle, total_us)
 }
 
 // ─── Internal ─────────────────────────────────────────────────────────────────
@@ -83,7 +104,8 @@ enum Ev {
     Tempo(u32),
 }
 
-fn play(path: &Path, tx: &Sender<MidiEvent>, stop: &AtomicBool) -> Result<(), String> {
+/// Parse the MIDI file and return `(timed_events, total_duration_us)`.
+fn parse_file(path: &Path) -> Result<(Vec<(u64, Ev)>, u64), String> {
     let data = std::fs::read(path)
         .map_err(|e| format!("read {:?}: {}", path, e))?;
     let smf = midly::Smf::parse(&data)
@@ -128,7 +150,7 @@ fn play(path: &Path, tx: &Sender<MidiEvent>, stop: &AtomicBool) -> Result<(), St
         })
     });
 
-    // Pre-compute absolute microsecond timestamps, honouring tempo changes.
+    // Pre-compute absolute µs timestamps, honouring tempo changes.
     let mut us_per_beat: u64 = 500_000; // 120 BPM
     let mut cur_tick: u64 = 0;
     let mut cur_us: u64 = 0;
@@ -142,31 +164,115 @@ fn play(path: &Path, tx: &Sender<MidiEvent>, stop: &AtomicBool) -> Result<(), St
         timed.push((cur_us, ev));
     }
 
-    // Play back with wall-clock scheduling; check stop every 10 ms during sleeps.
-    let start = Instant::now();
+    let total_us = timed.last().map(|(t, _)| *t).unwrap_or(0);
+    Ok((timed, total_us))
+}
+
+fn play_events(
+    timed: Vec<(u64, Ev)>,
+    tx: &Sender<MidiEvent>,
+    stop: &AtomicBool,
+    paused: &AtomicBool,
+    current_us: &AtomicU64,
+    seek_to: &AtomicU64,
+) {
     let chunk = Duration::from_millis(10);
-    for (time_us, ev) in timed {
+    let total_us = timed.last().map(|(t, _)| *t).unwrap_or(0);
+    let mut start = Instant::now();
+    let mut idx = 0usize;
+
+    'outer: loop {
+        // 1. Stop
         if stop.load(Ordering::Relaxed) { break; }
 
-        let target = Duration::from_micros(time_us);
-        let elapsed = start.elapsed();
-        if target > elapsed {
-            let mut remaining = target - elapsed;
-            while remaining > chunk {
-                thread::sleep(chunk);
-                if stop.load(Ordering::Relaxed) { return Ok(()); }
-                remaining = target.saturating_sub(start.elapsed());
-            }
-            thread::sleep(remaining);
+        // 2. Seek
+        let seek = seek_to.swap(NO_SEEK, Ordering::Relaxed);
+        if seek != NO_SEEK {
+            let target = seek.min(total_us);
+            start = Instant::now()
+                .checked_sub(Duration::from_micros(target))
+                .unwrap_or_else(Instant::now);
+            idx = timed.partition_point(|(t, _)| *t < target);
+            current_us.store(target, Ordering::Relaxed);
+            let _ = tx.send(MidiEvent::AllNotesOff);
         }
 
-        let midi_ev = match ev {
-            Ev::NoteOn  { channel, key, vel } => MidiEvent::NoteOn  { channel, note: key, velocity: vel },
-            Ev::NoteOff { channel, key }      => MidiEvent::NoteOff { channel, note: key },
-            Ev::Cc      { channel, cc, val }  => MidiEvent::ControlChange { channel, controller: cc, value: val },
-            Ev::Tempo(_) => continue,
+        // 3. Pause – spin until unpaused, handling seeks and stops mid-pause.
+        if paused.load(Ordering::Relaxed) {
+            // Capture position at the moment of pausing.
+            let mut pos = start.elapsed().as_micros() as u64;
+            current_us.store(pos, Ordering::Relaxed);
+
+            loop {
+                thread::sleep(chunk);
+                if stop.load(Ordering::Relaxed) { break 'outer; }
+
+                // Seek while paused: update position + index but stay paused.
+                let seek2 = seek_to.swap(NO_SEEK, Ordering::Relaxed);
+                if seek2 != NO_SEEK {
+                    pos = seek2.min(total_us);
+                    idx = timed.partition_point(|(t, _)| *t < pos);
+                    current_us.store(pos, Ordering::Relaxed);
+                    let _ = tx.send(MidiEvent::AllNotesOff);
+                }
+
+                if !paused.load(Ordering::Relaxed) { break; }
+            }
+
+            // Resume: set start so start.elapsed() == pos.
+            start = Instant::now()
+                .checked_sub(Duration::from_micros(pos))
+                .unwrap_or_else(Instant::now);
+            continue 'outer;
+        }
+
+        // 4. Done?
+        if idx >= timed.len() { break; }
+
+        // 5. Update position.
+        let now_us = start.elapsed().as_micros() as u64;
+        current_us.store(now_us, Ordering::Relaxed);
+
+        // 6. Sleep until the next event's timestamp.
+        let event_time_us = timed[idx].0;
+        if event_time_us > now_us {
+            let mut remaining = Duration::from_micros(event_time_us - now_us);
+            while remaining > chunk {
+                thread::sleep(chunk);
+                if stop.load(Ordering::Relaxed) { break 'outer; }
+                if seek_to.load(Ordering::Relaxed) != NO_SEEK { continue 'outer; }
+                if paused.load(Ordering::Relaxed) { continue 'outer; }
+                let new_us = start.elapsed().as_micros() as u64;
+                current_us.store(new_us, Ordering::Relaxed);
+                if new_us >= event_time_us { break; }
+                remaining = Duration::from_micros(event_time_us.saturating_sub(new_us));
+            }
+            if !remaining.is_zero() && remaining <= chunk {
+                thread::sleep(remaining);
+            }
+        }
+
+        // Re-check after sleep.
+        if stop.load(Ordering::Relaxed) { break; }
+        if seek_to.load(Ordering::Relaxed) != NO_SEEK { continue; }
+        if paused.load(Ordering::Relaxed) { continue; }
+
+        // 7. Send event.
+        let midi_ev = match &timed[idx].1 {
+            Ev::NoteOn  { channel, key, vel } =>
+                MidiEvent::NoteOn  { channel: *channel, note: *key, velocity: *vel },
+            Ev::NoteOff { channel, key } =>
+                MidiEvent::NoteOff { channel: *channel, note: *key },
+            Ev::Cc      { channel, cc, val } =>
+                MidiEvent::ControlChange { channel: *channel, controller: *cc, value: *val },
+            Ev::Tempo(_) => { idx += 1; continue; }
         };
         let _ = tx.send(midi_ev);
+        idx += 1;
     }
-    Ok(())
+
+    current_us.store(
+        start.elapsed().as_micros() as u64,
+        Ordering::Relaxed,
+    );
 }

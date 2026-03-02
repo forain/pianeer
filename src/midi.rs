@@ -5,6 +5,7 @@
 use crossbeam_channel::Sender;
 use midir::{MidiInput, MidiInputConnection};
 
+use crate::midi_recorder::RecordHandle;
 use crate::sampler::MidiEvent;
 
 /// Hold the active MIDI connection alive. Drop to disconnect.
@@ -12,7 +13,7 @@ pub struct MidiConnection {
     _conn: MidiInputConnection<()>,
 }
 
-pub fn start_midi(tx: Sender<MidiEvent>) -> Result<MidiConnection, String> {
+pub fn start_midi(tx: Sender<MidiEvent>, record: RecordHandle) -> Result<MidiConnection, String> {
     let midi_in = MidiInput::new("pianeer").map_err(|e| e.to_string())?;
 
     let ports = midi_in.ports();
@@ -42,6 +43,12 @@ pub fn start_midi(tx: Sender<MidiEvent>) -> Result<MidiConnection, String> {
             "pianeer-input",
             move |_timestamp_us, raw, _| {
                 if let Some(event) = parse_midi(raw) {
+                    // Push to recording buffer if active.
+                    if let Ok(mut g) = record.lock() {
+                        if let Some(ref mut buf) = *g {
+                            buf.events.push((buf.start.elapsed(), event.clone()));
+                        }
+                    }
                     let _ = tx.send(event);
                 }
             },

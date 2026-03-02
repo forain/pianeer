@@ -1,8 +1,9 @@
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use crate::instruments::Instrument;
 
@@ -33,16 +34,43 @@ impl MenuItem {
     }
 }
 
+// ── Playback state ─────────────────────────────────────────────────────────────
+
 pub struct PlaybackState {
     pub stop: Arc<AtomicBool>,
     pub done: Arc<AtomicBool>,
+    pub paused: Arc<AtomicBool>,
+    pub current_us: Arc<AtomicU64>,
+    pub total_us: u64,
+    /// Write a µs position here to seek; midi_player uses u64::MAX as "no seek".
+    pub seek_to: Arc<AtomicU64>,
     pub _handle: thread::JoinHandle<()>,
     pub menu_idx: usize,
 }
 
+/// Snapshot passed to print_menu / web snapshot (no Arc needed — just plain values).
+#[derive(Clone, serde::Serialize)]
+pub struct PlaybackInfo {
+    pub current_us: u64,
+    pub total_us: u64,
+    pub paused: bool,
+    pub menu_idx: usize,
+}
+
+impl PlaybackState {
+    pub fn info(&self) -> PlaybackInfo {
+        PlaybackInfo {
+            current_us: self.current_us.load(Ordering::Relaxed),
+            total_us:   self.total_us,
+            paused:     self.paused.load(Ordering::Relaxed),
+            menu_idx:   self.menu_idx,
+        }
+    }
+}
+
 // ── Runtime stats ─────────────────────────────────────────────────────────────
 
-#[derive(Default, PartialEq)]
+#[derive(Default, PartialEq, Clone, serde::Serialize)]
 pub struct ProcStats {
     pub cpu_pct: u8,   // 0–100 %
     pub mem_mb: u32,   // resident set in MiB
@@ -57,10 +85,6 @@ pub struct ProcStats {
 fn vu_bar(peak: f32) -> String {
     const WIDTH: usize = 20;
     const DB_FLOOR: f32 = -48.0;
-    // Zone boundaries (in filled-bar chars at full scale):
-    //  green:  0..15  → -48 to -12 dB  (75 %)
-    //  yellow: 15..19 → -12 to  -3 dB  (next 20 %)
-    //  red:    19..20 →  -3 to   0 dB+ (top  5 %)
     const GREEN_END: usize  = 15;
     const YELLOW_END: usize = 19;
 
@@ -87,7 +111,7 @@ fn vu_bar(peak: f32) -> String {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, serde::Serialize)]
 pub enum VeltrackLevel { Off, Soft, Normal, Hard }
 
 impl VeltrackLevel {
@@ -118,7 +142,7 @@ impl VeltrackLevel {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, serde::Serialize)]
 pub enum TunePreset { A415, A432, A440, A442, A444 }
 
 impl TunePreset {
@@ -152,6 +176,7 @@ impl TunePreset {
     }
 }
 
+#[derive(Clone, serde::Serialize)]
 pub struct Settings {
     pub veltrack: VeltrackLevel,
     pub tune: TunePreset,
@@ -180,13 +205,18 @@ pub enum MenuAction {
     CursorUp,
     CursorDown,
     Select,
-    CycleVariant(i8),      // ← / →
-    CycleVeltrack,         // V
-    CycleTune,             // T
-    ToggleRelease,         // E
-    VolumeChange(i8),      // + / -
-    TransposeChange(i8),   // [ / ]
-    ToggleResonance,       // H
+    SelectAt(usize),                          // web: single click
+    CycleVariant(i8),                         // ← / →
+    CycleVariantAt { idx: usize, dir: i8 },  // web: per-row ◄/► buttons
+    CycleVeltrack,                            // V
+    CycleTune,                                // T
+    ToggleRelease,                            // E
+    VolumeChange(i8),                         // + / -
+    TransposeChange(i8),                      // [ / ]
+    ToggleResonance,                          // H
+    ToggleRecord,                             // W
+    PauseResume,                              // Space
+    SeekRelative(i64),                        // , / .  (seconds)
 }
 
 // ── Playback helpers ──────────────────────────────────────────────────────────
@@ -204,6 +234,32 @@ pub fn playing_idx(pb: &Option<PlaybackState>) -> Option<usize> {
         .map(|p| p.menu_idx)
 }
 
+// ── Seekbar ───────────────────────────────────────────────────────────────────
+
+fn fmt_time(us: u64) -> String {
+    let secs = us / 1_000_000;
+    format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
+fn seekbar_line(info: &PlaybackInfo) -> String {
+    const W: usize = 32;
+    let frac = if info.total_us > 0 {
+        (info.current_us as f64 / info.total_us as f64).clamp(0.0, 1.0)
+    } else { 0.0 };
+    let filled = (frac * W as f64).round() as usize;
+    let bar: String = (0..W).map(|i| if i < filled { '═' } else { '░' }).collect();
+    let icon   = if info.paused { "⏸" } else { "▶" };
+    let action = if info.paused { "resume" } else { "pause " };
+    format!(
+        "  {} {} / {}  \x1b[36m[{}]\x1b[0m  Space:{} ,/.:±10s",
+        icon,
+        fmt_time(info.current_us),
+        fmt_time(info.total_us),
+        bar,
+        action,
+    )
+}
+
 // ── print_menu ────────────────────────────────────────────────────────────────
 
 pub fn print_menu(
@@ -214,10 +270,13 @@ pub fn print_menu(
     settings: &Settings,
     sustain: bool,
     stats: &ProcStats,
+    recording: bool,
+    rec_elapsed: Option<Duration>,
+    pb_info: Option<&PlaybackInfo>,
 ) {
     print!("\x1b[2J\x1b[H");
     print!("Pianeer  \u{2191}/\u{2193} nav  Enter load  \u{2190}/\u{2192} variant  R rescan  Q quit\r\n");
-    print!("  V vel  T tune  E release  +/- vol  [/] trns  H res\r\n");
+    print!("  V vel  T tune  E release  +/- vol  [/] trns  H res  W rec\r\n");
 
     // Settings status bar
     let sus_label = if sustain { "\x1b[1mSus:ON\x1b[0m" } else { "Sus:off" };
@@ -246,6 +305,19 @@ pub fn print_menu(
         vu_bar(stats.peak_l), vu_bar(stats.peak_r), clip_str,
     );
 
+    // Recording indicator
+    if recording {
+        let rec_time = rec_elapsed
+            .map(|d| fmt_time(d.as_micros() as u64))
+            .unwrap_or_else(|| "00:00".to_string());
+        print!("  \x1b[1;31m● REC {}\x1b[0m  (W to stop)\r\n", rec_time);
+    }
+
+    // Seekbar (MIDI playback)
+    if let Some(info) = pb_info {
+        print!("{}\r\n", seekbar_line(info));
+    }
+
     let has_inst = menu.iter().any(|m| matches!(m, MenuItem::Instrument(_)));
     let mut in_midi = false;
 
@@ -261,12 +333,16 @@ pub fn print_menu(
 
         let is_loaded = matches!(item, MenuItem::Instrument(_)) && i == loaded;
         let is_playing = playing == Some(i);
-        // Fixed-width tag column (9 chars) keeps titles aligned.
-        let tag = if is_playing { "[playing]" } else if is_loaded { "[loaded] " } else { "         " };
+        let is_paused  = pb_info.map(|p| p.menu_idx == i && p.paused).unwrap_or(false);
+
+        let tag = if is_paused  { "[paused] " }
+                  else if is_playing { "[playing]" }
+                  else if is_loaded  { "[loaded] " }
+                  else               { "         " };
+
         let type_label = item.type_label();
         let title = item.display_name();
 
-        // Append variant indicator for instruments with multiple variants.
         let variant_suffix = if let MenuItem::Instrument(inst) = item {
             if let Some(vname) = inst.variant_name() {
                 format!(" [{} \u{25c4}\u{25ba}]", vname)
