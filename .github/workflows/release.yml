@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  # ── macOS ─────────────────────────────────────────────────────────────────
+  # Runs on an Apple Silicon runner; adds x86_64 as a cross target so we can
+  # merge both slices into a single universal binary with lipo.
+  build-macos:
+    name: macOS universal (Intel + Apple Silicon)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin   # aarch64-apple-darwin is the runner's native target
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (Intel x86_64)
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Build (Apple Silicon arm64)
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Merge into universal binary
+        run: |
+          lipo -create \
+            -output pianeer-macos-universal \
+            target/x86_64-apple-darwin/release/pianeer \
+            target/aarch64-apple-darwin/release/pianeer
+          lipo -info pianeer-macos-universal
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pianeer-macos-universal
+          path: pianeer-macos-universal
+
+  # ── Linux ─────────────────────────────────────────────────────────────────
+  # Both builds are native (no cross-compilation): ubuntu-latest is x86_64,
+  # ubuntu-24.04-arm is aarch64 — the same architecture as Raspberry Pi OS 64-bit.
+  build-linux:
+    name: Linux ${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: pianeer-linux-amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: pianeer-linux-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install JACK dev headers
+        run: sudo apt-get update -qq && sudo apt-get install -y libjack-jackd2-dev
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        run: cp target/${{ matrix.target }}/release/pianeer ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  # ── GitHub Release ────────────────────────────────────────────────────────
+  # Only runs when the workflow was triggered by a version tag.
+  # Downloads all three artifacts into a flat directory and attaches them.
+  release:
+    name: Publish GitHub release
+    needs: [build-macos, build-linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true   # flatten: all files land directly in artifacts/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
