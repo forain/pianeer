@@ -170,10 +170,10 @@ async fn run(
         }
     };
 
-    eprintln!("Web UI:  http://localhost:8080  (Chrome/Edge 100+ required)");
+    eprintln!("Web UI:  http://localhost:4000  (Chrome/Edge 100+ required)");
     for san in &sans {
         if san != "localhost" && san != "127.0.0.1" && san != "::1" {
-            eprintln!("Web UI:  http://{san}:8080");
+            eprintln!("Web UI:  http://{san}:4000");
         }
     }
 
@@ -328,10 +328,10 @@ async fn serve_http(
             }
         }));
 
-    let listener = match tokio::net::TcpListener::bind("0.0.0.0:8080").await {
+    let listener = match tokio::net::TcpListener::bind("0.0.0.0:4000").await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("Web UI: failed to bind HTTP on :8080: {e}");
+            eprintln!("Web UI: failed to bind HTTP on :4000: {e}");
             return;
         }
     };
@@ -638,7 +638,7 @@ async function connect() {
 
   // ── WebSocket fallback (all browsers) ────────────────────────────────────
   await new Promise(resolve => {
-    const wsUrl = `ws://${window.location.hostname}:8080/ws`;
+    const wsUrl = `ws://${window.location.hostname}:4000/ws`;
     statusEl.textContent = `Connecting (WebSocket) to ${wsUrl}\u2026`;
     const ws = new WebSocket(wsUrl);
     ws.onopen  = () => {
