@@ -94,75 +94,44 @@ samples/
 | , / . | Seek MIDI playback ±10 s |
 | Q / Ctrl+C | Quit |
 
-## SFZ support
+## Format support
 
-Full `<global>` → `<master>` → `<group>` → `<region>` inheritance chain. `#include` and `#define` macro expansion. `<control>` for `default_path` and `set_cc`/`set_hdcc` initial CC values.
+| Feature | SFZ | ODF | GIG | Kontakt 2 |
+|---------|:---:|:---:|:---:|:---------:|
+| **File types** | `.sfz` | `.organ` | `.gig` | `.nki` `.nkm` |
+| **Velocity layers** | ✓ | ✓ | ✓ | ✓ |
+| **Loop points** | ✓ | ✓ | ✓ | — |
+| **Release triggers** | ✓ | ✓ | ✓ | ✓ |
+| **Timed release** (varies by key-hold duration) | — | ✓ | — | — |
+| **Round-robin / random selection** | ✓ | — | — | — |
+| **Keyswitches** | ✓ | — | — | — |
+| **CC-triggered regions** | ✓ | — | — | — |
+| **CC range filtering** (note-on conditions) | ✓ | — | — | — |
+| **CC-modulated parameters** (amp, release, pan…) | ✓ | — | — | — |
+| **Voice groups & off_by muting** | ✓ | — | — | — |
+| **Per-region polyphony limit** | ✓ | — | — | — |
+| **Stereo panning** | ✓ | — | — | — |
+| **Tuning / pitch control** | ✓ | ✓ | — | — |
+| **Sample start offset** | ✓ | — | — | — |
+| **Amplitude envelope release** | ✓ | — | — | ✓ |
+| **Nested parameter inheritance** | ✓ (4 levels) | — | — | ✓ (3 levels) |
+| **Multiple instruments per file** | — | — | ✓ | ✓ (`.nkm`) |
 
-| Opcode | Notes |
-|--------|-------|
-| `sample`, `lokey`, `hikey`, `key`, `lovel`, `hivel`, `pitch_keycenter` | Region mapping |
-| `amp_veltrack`, `volume`, `ampeg_release`, `off_time` | Amplitude and envelope |
-| `trigger` | `attack` or `release` |
-| `rt_decay` | Release-trigger amplitude decay (dB/s) |
-| `lorand`, `hirand` | Round-robin / random selection |
-| `group`, `off_by`, `note_polyphony` | Voice management |
-| `on_locc$N`, `on_hicc$N` | CC-event-triggered regions (any CC number) |
-| `locc$N`, `hicc$N` | CC range conditions for note-on filtering |
-| `pitch_keytrack`, `tune` | Pitch modulation |
-| `pan`, `pan_oncc$N` | Stereo panning |
-| `sw_last`, `sw_lokey`, `sw_hikey`, `sw_default` | Keyswitches |
-| `amplitude_oncc$N`, `amp_veltrack_oncc$N` | CC-modulated amplitude and velocity tracking |
-| `ampeg_release_oncc$N` | CC-modulated release time |
-| `offset`, `offset_oncc$N` | Sample start offset |
-| `loop_start`, `loop_end` | Loop points |
+### SFZ
 
-## ODF support
+INI-like text format. Full `<global>` → `<master>` → `<group>` → `<region>` inheritance with `#include` / `#define` macro expansion. The most feature-complete format supported: CC modulation, round-robin, keyswitches, voice groups, panning, and sample offsets are all SFZ-only capabilities.
 
-Grand Orgue ODF (`.organ`) files use an INI-style format with `[Organ]` and `[RankNNN]` sections.
+### ODF (Grand Orgue)
 
-| Key | Notes |
-|-----|-------|
-| `NumberOfRanks` | Number of `[RankNNN]` sections to load |
-| `FirstMidiNoteNumber`, `NumberOfLogicalPipes` | MIDI range for the rank |
-| `AmplitudeLevel`, `Gain` | Rank gain (% and dB) |
-| `HarmonicNumber`, `MidiPitchFraction` | Tuning |
-| `PipeNNN`, `PipeNNNAttackCount`, `PipeNNNAttack001`… | Attack samples with optional velocity layers |
-| `PipeNNNLoopCount`, `PipeNNNLoop001Start/End` | Loop points |
-| `PipeNNNReleaseCount`, `PipeNNNRelease001`…, `PipeNNNReleaseNNNMaxKeyPressTime` | Timed release samples |
+INI-style `.organ` files with `[Organ]` and `[RankNNN]` sections. Unique feature: **timed release samples** — each pipe can define multiple release samples selected by how long the key was held (`MaxKeyPressTime`). Tuning via `HarmonicNumber` and `MidiPitchFraction`. `DUMMY` and `REF:` pipe entries are skipped.
 
-`DUMMY` and `REF:` pipe entries are skipped.
+### GIG
 
-## GIG support
+RIFF/DLS Level 2 container (`.gig`) with embedded 16-bit PCM, used by GigaSampler and LinuxSampler. PCM data is decoded at load time; regions sharing the same wave-pool entry share a reference-counted buffer. Prefers a combined attack+release instrument (encoded via the `RELEASETRIGGER` dimension) when present; falls back to separate attack and release instruments otherwise.
 
-GIG (`.gig`) is a RIFF/DLS Level 2 container with embedded 16-bit PCM audio, used by GigaSampler and LinuxSampler. Samples are decoded in-memory at load time; regions sharing the same pool entry share the PCM buffer via reference counting.
+### Kontakt 2
 
-Instrument selection prefers the first combined instrument (one that encodes both attack and release via a `RELEASETRIGGER` (0x84) dimension). If no combined instrument exists, the first pure-attack and first pure-release instruments are loaded instead.
-
-| Concept | Notes |
-|---------|-------|
-| Wave pool (`ptbl` + `wvpl`) | Up to 32-bit pool index table; offsets relative to `wvpl` data start |
-| Dimension regions (`3lnk`) | `SAMPLECHANNEL` (0x80), `VELOCITY` (0x82), and `RELEASETRIGGER` (0x84) dimensions; left-channel (SC=0) side only |
-| Velocity ranges | `VelocityUpperLimit` read from `3ewa` chunk at byte offset +124, one per DimRegion |
-| Loop points | Read from wave-level `wsmp` chunk: `LoopStart` / `LoopStart + LoopLength` (exclusive end) |
-| Trigger detection | Combined instrument: `RELEASETRIGGER` dim-zone 0 → `Attack`, zone 1 → `Release`. Pure instrument: name containing "release" → `Trigger::Release`; otherwise `Trigger::Attack` |
-| Pitch | `pitch_keycenter = key_range.low` (one sample per key, plays at 1× speed on its mapped key) |
-
-## Kontakt 2 support
-
-Reads `.nki` (single program) and `.nkm` (multi-program bank) files. The binary format contains a zlib-compressed XML payload. `.nkm` files are suppressed in the menu when `.nki` files are present in the same directory.
-
-| Element | Attribute | Notes |
-|---------|-----------|-------|
-| `K2_Program` | `volume` | Program-level linear gain, converted to dB |
-| `K2_Group` | `releaseTrigger` | `"yes"` → `trigger=release`, otherwise `trigger=attack` |
-| `K2_Group` | `volume` | Group linear gain, added to program gain |
-| `K2_Group` > `Envelope` | `release` | Amplitude envelope release time in seconds |
-| `K2_Zone` | `groupIdx` | Links zone to its parent group |
-| `K2_Zone` | `lowKey`, `highKey` | MIDI note range |
-| `K2_Zone` | `rootKey` | Pitch centre for transposition |
-| `K2_Zone` | `lowVelocity`, `highVelocity` | Velocity range (1-based, converted to 0-based) |
-| `K2_Zone` | `zoneVolume` | Zone linear gain, added to group+program gain |
-| `K2_Zone` > `Sample` | `file_ex2` | Encoded sample path: `@d<len><dir>…F-<10flags><file>` |
+Binary `.nki` / `.nkm` files with a zlib-compressed XML payload. Three-level hierarchy: program → group → zone. `.nkm` multi-program banks are suppressed in the menu when `.nki` files exist in the same directory.
 
 ## Architecture
 
