@@ -168,6 +168,17 @@ async fn run(
         cert_bytes.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
     );
 
+    // Always start the HTTP server first so :4000 is reachable even if
+    // WebTransport / QUIC fails to bind (e.g. firewall on macOS).
+    eprintln!("Web UI:  http://localhost:4000  (Chrome/Edge 100+ required)");
+    for san in &sans {
+        if san != "localhost" && san != "127.0.0.1" && san != "::1" {
+            eprintln!("Web UI:  http://{san}:4000");
+        }
+    }
+    let snap_http = Arc::clone(&snapshot);
+    tokio::spawn(serve_http(cert_hash_json, snap_http, action_tx.clone(), Arc::clone(&reload)));
+
     let config = ServerConfig::builder()
         .with_bind_default(4433)
         .with_identity(identity)
@@ -177,21 +188,13 @@ async fn run(
     let server = match Endpoint::server(config) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Web UI: failed to bind QUIC/WebTransport on :4433: {e}");
+            eprintln!("Web UI: WebTransport unavailable ({e}); using WebSocket fallback on :4000");
+            // Park this future forever so the tokio runtime (and the HTTP
+            // server task above) stays alive.
+            std::future::pending::<()>().await;
             return;
         }
     };
-
-    eprintln!("Web UI:  http://localhost:4000  (Chrome/Edge 100+ required)");
-    for san in &sans {
-        if san != "localhost" && san != "127.0.0.1" && san != "::1" {
-            eprintln!("Web UI:  http://{san}:4000");
-        }
-    }
-
-    // HTTP server serving the single-page HTML app + WebSocket fallback.
-    let snap_http = Arc::clone(&snapshot);
-    tokio::spawn(serve_http(cert_hash_json, snap_http, action_tx.clone(), Arc::clone(&reload)));
 
     // Accept WebTransport sessions.
     loop {
