@@ -346,16 +346,24 @@ async fn serve_http(
             }
         }));
 
-    let listener = match tokio::net::TcpListener::bind("0.0.0.0:4000").await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("Web UI: failed to bind HTTP on :4000: {e}");
-            return;
-        }
-    };
+    // Bind both IPv4 and IPv6 so `http://localhost:4000` works on macOS,
+    // where browsers resolve `localhost` to ::1 (IPv6) first.
+    // On Linux with dual-stack [::] covers both; the 0.0.0.0 bind may
+    // fail with EADDRINUSE in that case — that's fine, we ignore it.
+    let l4 = tokio::net::TcpListener::bind("0.0.0.0:4000").await.ok();
+    let l6 = tokio::net::TcpListener::bind("[::]:4000").await.ok();
 
-    if let Err(e) = axum::serve(listener, app).await {
-        eprintln!("Web UI HTTP server error: {e}");
+    if l4.is_none() && l6.is_none() {
+        eprintln!("Web UI: failed to bind HTTP on :4000");
+        return;
+    }
+
+    if let Some(l) = l6 {
+        let a = app.clone();
+        tokio::spawn(async move { axum::serve(l, a).await.ok(); });
+    }
+    if let Some(l) = l4 {
+        tokio::spawn(async move { axum::serve(l, app).await.ok(); });
     }
 }
 
