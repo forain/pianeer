@@ -66,8 +66,8 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install JACK dev headers
-        run: sudo apt-get update -qq && sudo apt-get install -y libjack-jackd2-dev
+      - name: Install dev headers
+        run: sudo apt-get update -qq && sudo apt-get install -y libjack-jackd2-dev libasound2-dev
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
