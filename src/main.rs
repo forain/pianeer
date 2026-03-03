@@ -167,17 +167,17 @@ fn main() {
         s.master_tune_semitones = auto_tune; // settings.tune defaults to A440 (0.0)
     }
 
-    // 10. Start MIDI input thread.
+    // 10. Start MIDI input thread (optional — app runs without a keyboard).
     let record_handle = midi_recorder::new_handle();
     let _midi_conn = match midi::start_midi(midi_tx.clone(), Arc::clone(&record_handle)) {
         Ok(conn) => {
             println!("MIDI input connected.");
-            conn
+            Some(conn)
         }
         Err(e) => {
-            eprintln!("Warning: MIDI connection failed: {}.", e);
-            eprintln!("Hint: make sure the Keystation is plugged in.");
-            std::process::exit(1);
+            eprintln!("Warning: MIDI connection failed: {e}.");
+            eprintln!("Continuing without MIDI input (web UI and MIDI file playback still available).");
+            None
         }
     };
 
