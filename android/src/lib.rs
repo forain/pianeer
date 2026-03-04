@@ -18,7 +18,11 @@ use crossbeam_channel::bounded;
 use pianeer_core::loader::load_instrument_data;
 use pianeer_core::sampler::{MidiEvent, SamplerState};
 use pianeer_core::snapshot::build_snapshot;
-use pianeer_core::types::{MenuAction, MenuItem, PlaybackInfo, ProcStats, Settings};
+use pianeer_core::sys_stats::{read_cpu_ticks, read_mem_mb};
+use pianeer_core::types::{
+    MenuAction, MenuItem, PlaybackInfo, PlaybackState, ProcStats, Settings,
+    stop_playback, playing_idx,
+};
 use pianeer_core::{instruments, midi_player, midi_recorder};
 use pianeer_egui::{LocalBackend, PianeerApp};
 #[cfg(target_os = "android")]
@@ -27,65 +31,6 @@ use oboe::Stereo;
 const SAMPLES_DIR: &str = "/sdcard/Pianeer/samples";
 const MIDI_DIR: &str = "/sdcard/Pianeer/midi";
 
-// ── PlaybackState (local copy; desktop version lives in desktop/src/ui.rs) ────
-
-struct PlaybackState {
-    stop:       Arc<AtomicBool>,
-    done:       Arc<AtomicBool>,
-    paused:     Arc<AtomicBool>,
-    current_us: Arc<AtomicU64>,
-    total_us:   u64,
-    seek_to:    Arc<AtomicU64>,
-    _handle:    thread::JoinHandle<()>,
-    menu_idx:   usize,
-}
-
-impl PlaybackState {
-    fn info(&self) -> PlaybackInfo {
-        PlaybackInfo {
-            current_us: self.current_us.load(Ordering::Relaxed),
-            total_us:   self.total_us,
-            paused:     self.paused.load(Ordering::Relaxed),
-            menu_idx:   self.menu_idx,
-        }
-    }
-}
-
-fn stop_playback(pb: &mut Option<PlaybackState>) {
-    if let Some(p) = pb.take() {
-        p.stop.store(true, Ordering::Relaxed);
-    }
-}
-
-fn playing_idx(pb: &Option<PlaybackState>) -> Option<usize> {
-    pb.as_ref()
-        .filter(|p| !p.done.load(Ordering::Relaxed))
-        .map(|p| p.menu_idx)
-}
-
-// ── System stats (Android kernel is Linux) ────────────────────────────────────
-
-fn read_cpu_ticks() -> Option<u64> {
-    let data = std::fs::read_to_string("/proc/self/stat").ok()?;
-    let after_comm = data.rfind(')')?.checked_add(1)?;
-    let rest = data[after_comm..].trim_start();
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    let utime: u64 = fields.get(11)?.parse().ok()?;
-    let stime: u64 = fields.get(12)?.parse().ok()?;
-    Some(utime + stime)
-}
-
-fn read_mem_mb() -> u32 {
-    let data = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    for line in data.lines() {
-        if line.starts_with("VmRSS:") {
-            if let Some(kb) = line.split_whitespace().nth(1).and_then(|s| s.parse::<u32>().ok()) {
-                return kb / 1024;
-            }
-        }
-    }
-    0
-}
 
 // ── Menu discovery ────────────────────────────────────────────────────────────
 

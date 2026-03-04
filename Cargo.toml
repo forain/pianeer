@@ -6,6 +6,7 @@ members = [
     "egui-app",
     "web-wasm",
     "android",
+    "tools/wav2flac",
 ]
 
 [profile.release]

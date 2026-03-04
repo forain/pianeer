@@ -172,11 +172,63 @@ jobs:
           name: pianeer-android
           path: target/release/apk/pianeer-android.apk
 
+  # ── Haiku ─────────────────────────────────────────────────────────────────
+  # Cross-compiled from Linux using the official Haiku cross-compiler Docker
+  # image (ghcr.io/haiku/cross-compiler:x86_64-r1beta5), which ships the full
+  # Haiku R1/beta5 sysroot including media and midi2 headers/libs.
+  # Requires Rust nightly + -Z build-std because x86_64-unknown-haiku is Tier 3.
+  build-haiku:
+    name: Haiku x86_64
+    runs-on: ubuntu-latest
+    needs: [build-wasm]
+    container:
+      image: ghcr.io/haiku/cross-compiler:x86_64-r1beta5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly with rust-src
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- --default-toolchain nightly \
+                     --component rust-src \
+                     --target x86_64-unknown-haiku \
+                     --no-modify-path \
+                     -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-unknown-haiku
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm-dist
+          path: web-wasm/dist/
+
+      - name: Build
+        env:
+          CC_x86_64_unknown_haiku:  x86_64-unknown-haiku-gcc
+          CXX_x86_64_unknown_haiku: x86_64-unknown-haiku-g++
+          AR_x86_64_unknown_haiku:  x86_64-unknown-haiku-ar
+          CARGO_TARGET_X86_64_UNKNOWN_HAIKU_LINKER: x86_64-unknown-haiku-gcc
+        run: |
+          cargo build --release -p pianeer \
+            --target x86_64-unknown-haiku \
+            -Z build-std=std,panic_abort
+
+      - name: Stage artifact
+        run: cp target/x86_64-unknown-haiku/release/pianeer pianeer-haiku-amd64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pianeer-haiku-amd64
+          path: pianeer-haiku-amd64
+
   # ── GitHub Release ───────────────────────────────────────────────────────────
   # Only runs on version tags; downloads all artifacts and attaches them.
   release:
     name: Publish GitHub release
-    needs: [build-macos, build-linux, build-android]
+    needs: [build-macos, build-linux, build-android, build-haiku]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:

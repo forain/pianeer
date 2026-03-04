@@ -1,0 +1,13 @@
+[package]
+name = "wav2flac"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "wav2flac"
+path = "src/main.rs"
+
+[dependencies]
+hound    = "3"
+flacenc  = "0.4"
+rayon    = "1"
