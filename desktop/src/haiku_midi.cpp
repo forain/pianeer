@@ -30,13 +30,15 @@ void* haiku_midi_consumer_create(void* cookie,
     c->cookie = cookie; c->note_on_fn = note_on; c->note_off_fn = note_off; c->cc_fn = cc;
     c->Register();
 
-    BMidiRoster* roster = BMidiRoster::MidiRoster();
-    int32 id = 0; BMidiEndpoint* ep;
-    while ((ep = roster->NextEndpoint(&id)) != nullptr) {
-        if (ep->IsProducer() && ep->IsRegistered() && !ep->IsLocal()) {
-            if (auto* prod = dynamic_cast<BMidiProducer*>(ep)) { prod->Connect(c); ep->Release(); break; }
+    int32 id = 0;
+    BMidiProducer* prod;
+    while ((prod = BMidiRoster::NextProducer(&id)) != nullptr) {
+        if (!prod->IsLocal()) {
+            prod->Connect(c);
+            prod->Release();
+            break;
         }
-        ep->Release();
+        prod->Release();
     }
     return c;
 }
