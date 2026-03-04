@@ -4,8 +4,6 @@ mod ui;
 mod terminal;
 #[cfg(feature = "native-ui")]
 mod gui;
-#[cfg(target_os = "haiku")]
-mod haiku_term;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -109,9 +107,6 @@ fn main() {
     let show_qr = Arc::new(AtomicBool::new(false));
 
     let web_snapshot: Arc<Mutex<String>> = Arc::new(Mutex::new("{}".to_string()));
-    // wtransport (used by the web server) depends on quinn-udp which uses
-    // Linux-only socket APIs not present on Haiku.  Skip the web server there.
-    #[cfg(not(target_os = "haiku"))]
     {
         let (rb_prod, rb_cons) = ringbuf::HeapRb::<f32>::new(
             (sample_rate as usize) * 2 * 2 // 2 s headroom, stereo

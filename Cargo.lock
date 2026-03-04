@@ -2412,14 +2412,12 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 name = "pianeer"
 version = "0.2.0"
 dependencies = [
- "cc",
  "cpal",
  "crossbeam-channel",
  "crossterm",
  "eframe",
  "flate2",
  "jack",
- "libc",
  "midir",
  "pianeer-core",
  "pianeer-egui",

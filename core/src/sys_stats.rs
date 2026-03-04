@@ -25,7 +25,7 @@ pub fn read_cpu_ticks() -> Option<u64> {
 /// Cumulative CPU centiseconds (utime+stime) via getrusage.
 /// Returns centiseconds (100ths of a second) to match the Linux CLK_TCK=100
 /// convention so the same `delta / 100.0 / elapsed * 100` formula applies.
-#[cfg(any(target_os = "macos", target_os = "haiku"))]
+#[cfg(target_os = "macos")]
 pub fn read_cpu_ticks() -> Option<u64> {
     use std::mem::MaybeUninit;
     let mut usage = MaybeUninit::<libc::rusage>::uninit();
@@ -38,7 +38,7 @@ pub fn read_cpu_ticks() -> Option<u64> {
     Some(utime_cs + stime_cs)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "haiku")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn read_cpu_ticks() -> Option<u64> {
     None
 }
@@ -60,8 +60,8 @@ pub fn read_mem_mb() -> u32 {
 }
 
 /// Peak RSS in MiB via getrusage.
-/// On macOS/Haiku ru_maxrss is in bytes and reflects peak RSS.
-#[cfg(any(target_os = "macos", target_os = "haiku"))]
+/// On macOS ru_maxrss is in bytes and reflects peak RSS.
+#[cfg(target_os = "macos")]
 pub fn read_mem_mb() -> u32 {
     use std::mem::MaybeUninit;
     let mut usage = MaybeUninit::<libc::rusage>::uninit();
@@ -72,7 +72,7 @@ pub fn read_mem_mb() -> u32 {
     (u.ru_maxrss as u64 / 1024 / 1024) as u32
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "haiku")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn read_mem_mb() -> u32 {
     0
 }

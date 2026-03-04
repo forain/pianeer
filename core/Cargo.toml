@@ -23,6 +23,3 @@ include_dir  = { version = "0.7", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
-
-[target.'cfg(target_os = "haiku")'.dependencies]
-libc = "0.2"
