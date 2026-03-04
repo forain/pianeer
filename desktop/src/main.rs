@@ -4,6 +4,8 @@ mod ui;
 mod terminal;
 #[cfg(feature = "native-ui")]
 mod gui;
+#[cfg(target_os = "haiku")]
+mod haiku_term;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -96,12 +98,6 @@ fn main() {
     midi::spawn_midi_watcher(midi_tx.clone(), Arc::clone(&record_handle));
 
     // 10. Start audio stream.
-    let (rb_prod, rb_cons) = ringbuf::HeapRb::<f32>::new(
-        (sample_rate as usize) * 2 * 2 // 2 s headroom, stereo
-    ).split();
-    let audio_handle = pianeer_core::audio_stream::start(rb_cons, sample_rate as u32);
-    state.lock().unwrap().audio_sink = Some(rb_prod);
-
     let _audio = audio::start_audio(audio_probe, Arc::clone(&state))
         .unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
 
@@ -113,12 +109,23 @@ fn main() {
     let show_qr = Arc::new(AtomicBool::new(false));
 
     let web_snapshot: Arc<Mutex<String>> = Arc::new(Mutex::new("{}".to_string()));
-    let _web_thread = pianeer_core::web::spawn_web_server(
-        Arc::clone(&web_snapshot),
-        action_tx.clone(),
-        Arc::clone(&reload),
-        Arc::new(audio_handle),
-    );
+    // wtransport (used by the web server) depends on quinn-udp which uses
+    // Linux-only socket APIs not present on Haiku.  Skip the web server there.
+    #[cfg(not(target_os = "haiku"))]
+    {
+        let (rb_prod, rb_cons) = ringbuf::HeapRb::<f32>::new(
+            (sample_rate as usize) * 2 * 2 // 2 s headroom, stereo
+        ).split();
+        let audio_handle = pianeer_core::audio_stream::start(rb_cons, sample_rate as u32);
+        state.lock().unwrap().audio_sink = Some(rb_prod);
+        // Dropping the JoinHandle detaches the thread; it keeps running.
+        pianeer_core::web::spawn_web_server(
+            Arc::clone(&web_snapshot),
+            action_tx.clone(),
+            Arc::clone(&reload),
+            Arc::new(audio_handle),
+        );
+    }
 
     // 12. Run either the native GUI or the raw-mode terminal.
     #[cfg(feature = "native-ui")]
