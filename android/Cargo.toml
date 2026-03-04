@@ -1,0 +1,58 @@
+[package]
+name = "pianeer-android"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pianeer-core     = { path = "../core", features = ["web"] }
+ringbuf          = "0.3"
+pianeer-egui     = { path = "../egui-app" }
+android-activity = { version = "0.6", features = ["native-activity"] }
+eframe           = { version = "0.29", default-features = false, features = ["android-native-activity", "glow"] }
+egui             = { version = "0.29" }
+winit            = { version = "0.30", default-features = false, features = ["android-native-activity"] }
+oboe             = { version = "0.6", features = ["java-interface"] }
+crossbeam-channel = "0.5"
+serde_json        = "1"
+log               = "0.4"
+android_logger    = "0.14"
+jni               = { version = "0.21", default-features = false }
+
+[package.metadata.android]
+package = "com.pianeer.app"
+label = "Pianeer"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_EXTERNAL_STORAGE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.WRITE_EXTERNAL_STORAGE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.MANAGE_EXTERNAL_STORAGE"
+
+[package.metadata.android.sdk]
+min_sdk_version    = 21
+target_sdk_version = 35
+compile_sdk_version = 35
+
+[[package.metadata.android.activity]]
+name        = "android.app.NativeActivity"
+orientation = "landscape"
+theme       = "@android:style/Theme.NoTitleBar"
+
+[package.metadata.android.application]
+debuggable = false
+request_legacy_external_storage = true
+
+[package.metadata.android.signing.release]
+path       = "/run/media/forain/samsung970pro512/pianeer-release.jks"
+keystore_password = "pianeer123"
+alias      = "pianeer"
+key_password = "pianeer123"
