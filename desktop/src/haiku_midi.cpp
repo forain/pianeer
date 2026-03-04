@@ -1,4 +1,4 @@
-#include <MidiLocalConsumer.h>
+#include <MidiConsumer.h>
 #include <MidiRoster.h>
 #include <MidiProducer.h>
 #include <new>
