@@ -6,12 +6,37 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ── macOS ─────────────────────────────────────────────────────────────────
-  # Runs on an Apple Silicon runner; adds x86_64 as a cross target so we can
-  # merge both slices into a single universal binary with lipo.
+  # ── WASM bundle ──────────────────────────────────────────────────────────────
+  # Built once; every other job downloads the dist so core's include_dir! embeds
+  # the egui web UI into each binary at compile time.
+  build-wasm:
+    name: Build WASM bundle (trunk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install trunk
+        run: cargo install trunk --locked
+
+      - name: Build
+        run: cd web-wasm && trunk build --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-dist
+          path: web-wasm/dist/
+
+  # ── macOS ────────────────────────────────────────────────────────────────────
   build-macos:
     name: macOS universal (Intel + Apple Silicon)
     runs-on: macos-latest
+    needs: [build-wasm]
     steps:
       - uses: actions/checkout@v4
 
@@ -21,11 +46,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm-dist
+          path: web-wasm/dist/
+
       - name: Build (Intel x86_64)
-        run: cargo build --release --target x86_64-apple-darwin
+        run: cargo build --release -p pianeer --target x86_64-apple-darwin
 
       - name: Build (Apple Silicon arm64)
-        run: cargo build --release --target aarch64-apple-darwin
+        run: cargo build --release -p pianeer --target aarch64-apple-darwin
 
       - name: Merge into universal binary
         run: |
@@ -41,11 +71,10 @@ jobs:
           path: pianeer-macos-universal
 
   # ── Linux ─────────────────────────────────────────────────────────────────
-  # Both builds are native (no cross-compilation): ubuntu-latest is x86_64,
-  # ubuntu-24.04-arm is aarch64 — the same architecture as Raspberry Pi OS 64-bit.
   build-linux:
     name: Linux ${{ matrix.artifact }}
     runs-on: ${{ matrix.runner }}
+    needs: [build-wasm]
     strategy:
       fail-fast: false
       matrix:
@@ -66,11 +95,16 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm-dist
+          path: web-wasm/dist/
+
       - name: Install dev headers
         run: sudo apt-get update -qq && sudo apt-get install -y libjack-jackd2-dev libasound2-dev
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release -p pianeer --target ${{ matrix.target }}
 
       - name: Stage artifact
         run: cp target/${{ matrix.target }}/release/pianeer ${{ matrix.artifact }}
@@ -80,12 +114,69 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
-  # ── GitHub Release ────────────────────────────────────────────────────────
-  # Only runs when the workflow was triggered by a version tag.
-  # Downloads all three artifacts into a flat directory and attaches them.
+  # ── Android ─────────────────────────────────────────────────────────────────
+  build-android:
+    name: Android arm64 APK
+    runs-on: ubuntu-latest
+    needs: [build-wasm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm-dist
+          path: web-wasm/dist/
+
+      - name: Setup Android NDK r29
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+          add-to-path: false
+
+      - name: Install Android SDK components
+        run: |
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-35" \
+            "build-tools;35.0.1" \
+          || true   # already installed on the runner → ignore exit code
+
+      - name: Install cargo-apk
+        run: cargo install cargo-apk --locked
+
+      - name: Write release keystore
+        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > /tmp/pianeer-release.jks
+
+      - name: Patch keystore path in Cargo.toml
+        run: |
+          sed -i 's|path\s*=\s*"[^"]*pianeer-release\.jks"|path = "/tmp/pianeer-release.jks"|' \
+            android/Cargo.toml
+
+      - name: Build APK
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          # Must be an env var; cargo-apk strips RUSTFLAGS from .cargo/config.toml
+          RUSTFLAGS: >-
+            -C link-arg=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_static.a
+            -C link-arg=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++abi.a
+        run: cargo apk build --release -p pianeer-android
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pianeer-android
+          path: target/release/apk/pianeer-android.apk
+
+  # ── GitHub Release ───────────────────────────────────────────────────────────
+  # Only runs on version tags; downloads all artifacts and attaches them.
   release:
     name: Publish GitHub release
-    needs: [build-macos, build-linux]
+    needs: [build-macos, build-linux, build-android]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
@@ -94,7 +185,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-          merge-multiple: true   # flatten: all files land directly in artifacts/
+          merge-multiple: true
 
       - uses: softprops/action-gh-release@v2
         with:

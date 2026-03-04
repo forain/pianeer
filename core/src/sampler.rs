@@ -4,6 +4,7 @@
 //! Uses try_lock() on the shared mutex to avoid blocking.
 #![allow(dead_code)]
 use crossbeam_channel::Receiver;
+use ringbuf::HeapProducer;
 
 use crate::region::{Region, Trigger};
 
@@ -116,6 +117,9 @@ pub struct SamplerState {
     peak_hold_r: f32,
     /// Multiplicative decay applied per sample (20 dB/s fall time).
     peak_decay_per_frame: f32,
+    /// Lock-free ring buffer producer for the FLAC streaming encoder thread.
+    /// Written every process() call with stereo interleaved f32 output samples.
+    pub audio_sink: Option<HeapProducer<f32>>,
 }
 
 impl SamplerState {
@@ -144,7 +148,7 @@ impl SamplerState {
             veltrack_override: None,
             master_tune_semitones: 0.0,
             release_enabled: true,
-            master_volume: 1.0,
+            master_volume: 10.0_f32.powf(-12.0 / 20.0),
             transpose: 0,
             resonance_enabled: true,
             peak_l: 0.0,
@@ -155,6 +159,7 @@ impl SamplerState {
             peak_hold_r: 0.0,
             // 20 dB/s fall: amplitude × 10^(-1/sample_rate) per frame
             peak_decay_per_frame: (10.0_f32).powf(-1.0 / sample_rate as f32),
+            audio_sink: None,
         }
     }
 
@@ -234,6 +239,14 @@ impl SamplerState {
             for i in 0..n_frames {
                 out_l[i] *= self.master_volume;
                 out_r[i] *= self.master_volume;
+            }
+        }
+
+        // Tap post-volume audio for the FLAC streaming encoder (lock-free, non-blocking).
+        if let Some(ref mut sink) = self.audio_sink {
+            for i in 0..n_frames {
+                let _ = sink.push(out_l[i]);
+                let _ = sink.push(out_r[i]);
             }
         }
 

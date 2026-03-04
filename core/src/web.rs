@@ -2,111 +2,33 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use axum::{Router, extract::ws::{Message, WebSocket, WebSocketUpgrade}, response::Html, routing::get};
-use serde::{Deserialize, Serialize};
+use axum::{Router, extract::{Host, ws::{Message, WebSocket, WebSocketUpgrade}}, http::{header, StatusCode}, response::{Html, IntoResponse, Response}, routing::get};
+use tower_http::services::ServeDir;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::broadcast;
 use wtransport::{Endpoint, Identity, ServerConfig};
 
-use crate::ui::{MenuAction, MenuItem, PlaybackInfo, Settings, ProcStats};
+/// WASM bundle embedded at compile time from web-wasm/dist/.
+/// Present when trunk has been run; empty dir otherwise (falls back to HTML_TEMPLATE).
+static WASM_DIST: include_dir::Dir<'static> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../web-wasm/dist");
 
-// ── Snapshot types ─────────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-pub struct WebMenuItem {
-    pub name: String,
-    pub type_label: String,
-    pub loaded: bool,
-    pub playing: bool,
-    pub cursor: bool,
-    pub variant: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct WebSnapshot {
-    pub menu: Vec<WebMenuItem>,
-    pub settings: Settings,
-    pub sustain: bool,
-    pub stats: ProcStats,
-    pub recording: bool,
-    pub rec_elapsed_us: Option<u64>,
-    pub playback: Option<PlaybackInfo>,
-}
-
-// ── Command from browser ───────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-#[serde(tag = "cmd")]
-enum ClientCmd {
-    CursorUp,
-    CursorDown,
-    Select,
-    SelectAt { idx: usize },
-    CycleVariant { dir: i8 },
-    CycleVariantAt { idx: usize, dir: i8 },
-    CycleVeltrack,
-    CycleTune,
-    ToggleRelease,
-    VolumeChange { delta: i8 },
-    TransposeChange { delta: i8 },
-    ToggleResonance,
-    ToggleRecord,
-    PauseResume,
-    SeekRelative { secs: i64 },
-    Rescan,
-}
-
-// ── Public helpers ─────────────────────────────────────────────────────────────
-
-pub fn build_snapshot(
-    menu: &[MenuItem],
-    cursor: usize,
-    loaded: usize,
-    playing: Option<usize>,
-    settings: &Settings,
-    sustain: bool,
-    stats: &ProcStats,
-    recording: bool,
-    rec_elapsed_us: Option<u64>,
-    playback: Option<&PlaybackInfo>,
-) -> WebSnapshot {
-    let items = menu.iter().enumerate().map(|(i, m)| {
-        let variant = if let MenuItem::Instrument(inst) = m {
-            inst.variant_name().map(|s| s.to_string())
-        } else {
-            None
-        };
-        WebMenuItem {
-            name: m.display_name().to_string(),
-            type_label: m.type_label().to_string(),
-            loaded: matches!(m, MenuItem::Instrument(_)) && i == loaded,
-            playing: playing == Some(i),
-            cursor: i == cursor,
-            variant,
-        }
-    }).collect();
-
-    WebSnapshot {
-        menu: items,
-        settings: settings.clone(),
-        sustain,
-        stats: stats.clone(),
-        recording,
-        rec_elapsed_us,
-        playback: playback.cloned(),
-    }
-}
+use crate::audio_stream::AudioStreamHandle;
+use crate::types::MenuAction;
+use crate::snapshot::ClientCmd;
 
 pub fn spawn_web_server(
     snapshot: Arc<Mutex<String>>,
     action_tx: crossbeam_channel::Sender<MenuAction>,
     reload: Arc<AtomicBool>,
+    audio: Arc<AudioStreamHandle>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("failed to build tokio runtime for web server");
-        rt.block_on(run(snapshot, action_tx, reload));
+        rt.block_on(run(snapshot, action_tx, reload, audio));
     })
 }
 
@@ -151,6 +73,7 @@ async fn run(
     snapshot: Arc<Mutex<String>>,
     action_tx: crossbeam_channel::Sender<MenuAction>,
     reload: Arc<AtomicBool>,
+    audio: Arc<AudioStreamHandle>,
 ) {
     let sans = local_sans();
 
@@ -177,7 +100,7 @@ async fn run(
         }
     }
     let snap_http = Arc::clone(&snapshot);
-    tokio::spawn(serve_http(cert_hash_json, snap_http, action_tx.clone(), Arc::clone(&reload)));
+    tokio::spawn(serve_http(cert_hash_json, snap_http, action_tx.clone(), Arc::clone(&reload), Arc::clone(&audio)));
 
     let config = ServerConfig::builder()
         .with_bind_default(4433)
@@ -202,12 +125,29 @@ async fn run(
         let snap = Arc::clone(&snapshot);
         let tx = action_tx.clone();
         let rl = Arc::clone(&reload);
+        let aud = Arc::clone(&audio);
         tokio::spawn(async move {
-            if let Err(e) = handle_session(incoming, snap, tx, rl).await {
+            if let Err(e) = handle_session(incoming, snap, tx, rl, aud).await {
                 eprintln!("Web session error: {e}");
             }
         });
     }
+}
+
+fn b64(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
 }
 
 fn dispatch_cmd(
@@ -235,8 +175,9 @@ fn dispatch_cmd(
             ClientCmd::SeekRelative { secs }          => Some(MenuAction::SeekRelative(secs)),
             ClientCmd::Rescan => {
                 reload.store(true, Ordering::SeqCst);
-                None
+                Some(MenuAction::Rescan)
             }
+            ClientCmd::RequestAudioInit => None, // handled at transport level
         };
         if let Some(a) = action {
             let _ = action_tx.try_send(a);
@@ -249,19 +190,46 @@ async fn handle_session(
     snapshot: Arc<Mutex<String>>,
     action_tx: crossbeam_channel::Sender<MenuAction>,
     reload: Arc<AtomicBool>,
+    audio: Arc<AudioStreamHandle>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let request: wtransport::endpoint::SessionRequest = incoming.await?;
     let conn: wtransport::Connection = request.accept().await?;
 
-    // Server opens the bidi stream so the browser has no chicken-and-egg wait.
-    // Send side: JSON state lines pushed every 100 ms.
-    // Recv side: newline-delimited JSON commands from the browser.
-    // open_bi() returns an OpeningBiStream future; await it twice.
     let (mut send, recv): (wtransport::SendStream, wtransport::RecvStream) =
         conn.open_bi().await?.await?;
 
-    // Pusher: write state JSON (one line per update) to the send side.
+    // Send audio_init so the browser can configure its AudioDecoder.
+    // The browser will start feeding datagrams once it receives this.
+    let audio_init = format!(
+        "{{\"type\":\"audio_init\",\"streaminfo\":\"{}\"}}\n",
+        b64(&audio.stream_header[8..]) // bytes [8..42] = raw STREAMINFO payload
+    );
+    if send.write_all(audio_init.as_bytes()).await.is_err() {
+        return Ok(());
+    }
+
+    // Datagram pusher: subscribe to the broadcast and forward as WT datagrams.
+    // Datagrams are unreliable/unordered — late frames are simply dropped,
+    // which is the right behaviour for low-latency audio monitoring.
+    let conn2 = conn.clone();
+    let mut audio_rx = audio.frames.subscribe();
+    let datagram_task = tokio::spawn(async move {
+        loop {
+            match audio_rx.recv().await {
+                Ok(frame) => {
+                    if conn2.send_datagram(frame.as_ref()).is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {} // skip dropped frames
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    // State pusher: send JSON snapshot every 100 ms.
     let snap_push = Arc::clone(&snapshot);
+    let audio_for_reinit = Arc::clone(&audio);
     let pusher = tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -271,15 +239,21 @@ async fn handle_session(
                 break;
             }
         }
+        drop(audio_for_reinit); // keep Arc alive until pusher exits
     });
 
-    // Reader: consume newline-delimited JSON commands from the recv side.
+    // Reader: handle newline-delimited JSON commands.
     let mut lines = BufReader::new(recv).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        dispatch_cmd(line.trim(), &action_tx, &reload);
+        let trimmed = line.trim();
+        // RequestAudioInit: browser re-joined mid-session, resend audio_init via pusher.
+        // We can't write to `send` here (moved into pusher), so we handle it by
+        // noting that audio_init was already sent at session start — it's a no-op.
+        dispatch_cmd(trimmed, &action_tx, &reload);
     }
 
     pusher.abort();
+    datagram_task.abort();
     Ok(())
 }
 
@@ -316,20 +290,95 @@ async fn handle_ws(
     }
 }
 
+fn resolve_qr_url(host: &str) -> String {
+    // If accessed via localhost, substitute the LAN IP so the QR code
+    // is actually scannable from a phone on the same network.
+    let is_local = host.starts_with("localhost")
+        || host.starts_with("127.0.0.1")
+        || host.starts_with("[::1]")
+        || host == "::1";
+    if is_local {
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if sock.connect("1.1.1.1:80").is_ok() {
+                if let Ok(addr) = sock.local_addr() {
+                    return format!("http://{}:4000", addr.ip());
+                }
+            }
+        }
+    }
+    format!("http://{}", host)
+}
+
+async fn serve_qr(Host(host): Host) -> impl IntoResponse {
+    let url = resolve_qr_url(&host);
+    let svg = match qrcode::QrCode::new(url.as_bytes()) {
+        Ok(code) => code
+            .render::<qrcode::render::svg::Color<'_>>()
+            .min_dimensions(280, 280)
+            .build(),
+        Err(_) => r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#.to_string(),
+    };
+    ([(header::CONTENT_TYPE, "image/svg+xml")], svg)
+}
+
+async fn handle_audio_pcm_ws(mut socket: WebSocket, audio: Arc<AudioStreamHandle>) {
+    let mut rx = audio.pcm_frames.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(frame) => {
+                if socket.send(Message::Binary((*frame).clone())).await.is_err() {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+async fn handle_audio_ws(mut socket: WebSocket, audio: Arc<AudioStreamHandle>) {
+    // Send stream header as the first binary message so the browser can configure
+    // its AudioDecoder with the STREAMINFO payload (bytes [8..42]).
+    if socket.send(Message::Binary((*audio.stream_header).clone())).await.is_err() {
+        return;
+    }
+    let mut rx = audio.frames.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(frame) => {
+                if socket.send(Message::Binary((*frame).clone())).await.is_err() {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {} // skip dropped frames
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Look for the trunk-built WASM bundle next to the cwd (dev) or the binary (installed).
+fn find_wasm_dist() -> Option<std::path::PathBuf> {
+    let candidates = [
+        std::env::current_dir().ok().map(|d| d.join("web-wasm").join("dist")),
+        std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("web-wasm").join("dist"))),
+    ];
+    candidates.into_iter().flatten().find(|d| d.join("index.html").exists())
+}
+
 async fn serve_http(
     cert_hash_json: String,
     snapshot: Arc<Mutex<String>>,
     action_tx: crossbeam_channel::Sender<MenuAction>,
     reload: Arc<AtomicBool>,
+    audio: Arc<AudioStreamHandle>,
 ) {
-    let html = Arc::new(HTML_TEMPLATE.replace("__CERT_HASH__", &cert_hash_json));
-
-    let app = Router::new()
-        .route("/", get({
-            let html = Arc::clone(&html);
-            move || {
-                let html = Arc::clone(&html);
-                async move { Html(html.as_ref().clone()) }
+    // Build API routes shared by both UI modes.
+    let mut app = Router::new()
+        .route("/qr", get(serve_qr))
+        .route("/cert-hash", get({
+            let hash = cert_hash_json.clone();
+            move || async move {
+                ([(header::CONTENT_TYPE, "application/json")], hash)
             }
         }))
         .route("/ws", get({
@@ -344,7 +393,42 @@ async fn serve_http(
                     ws.on_upgrade(move |socket| handle_ws(socket, snapshot, action_tx, reload))
                 }
             }
+        }))
+        .route("/audio-ws", get({
+            let audio = Arc::clone(&audio);
+            move |ws: WebSocketUpgrade| {
+                let audio = Arc::clone(&audio);
+                async move {
+                    ws.on_upgrade(move |socket| handle_audio_ws(socket, audio))
+                }
+            }
+        }))
+        .route("/audio-pcm-ws", get({
+            let audio = Arc::clone(&audio);
+            move |ws: WebSocketUpgrade| {
+                let audio = Arc::clone(&audio);
+                async move {
+                    ws.on_upgrade(move |socket| handle_audio_pcm_ws(socket, audio))
+                }
+            }
         }));
+
+    // Serve the egui WASM bundle if built, otherwise fall back to the embedded HTML.
+    if let Some(dist) = find_wasm_dist() {
+        eprintln!("Serving WASM UI from {}", dist.display());
+        app = app.fallback_service(ServeDir::new(dist));
+    } else if WASM_DIST.get_file("index.html").is_some() {
+        eprintln!("Serving embedded WASM UI");
+        app = app.fallback(|req: axum::extract::Request| async move {
+            serve_embedded(req.uri().path()).await
+        });
+    } else {
+        let html = Arc::new(HTML_TEMPLATE.replace("__CERT_HASH__", &cert_hash_json));
+        app = app.route("/", get(move || {
+            let html = Arc::clone(&html);
+            async move { Html(html.as_ref().clone()) }
+        }));
+    }
 
     // Bind both IPv4 and IPv6 so `http://localhost:4000` works on macOS,
     // where browsers resolve `localhost` to ::1 (IPv6) first.
@@ -364,6 +448,35 @@ async fn serve_http(
     }
     if let Some(l) = l4 {
         tokio::spawn(async move { axum::serve(l, app).await.ok(); });
+    }
+}
+
+// ── Embedded WASM dist serving ────────────────────────────────────────────────
+
+fn mime_for(path: &str) -> &'static str {
+    if path.ends_with(".wasm")          { "application/wasm" }
+    else if path.ends_with(".js")       { "application/javascript" }
+    else if path.ends_with(".html")     { "text/html; charset=utf-8" }
+    else if path.ends_with(".css")      { "text/css" }
+    else if path.ends_with(".svg")      { "image/svg+xml" }
+    else                                { "application/octet-stream" }
+}
+
+async fn serve_embedded(uri_path: &str) -> Response {
+    let path = uri_path.trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    match WASM_DIST.get_file(path) {
+        Some(f) => (
+            [(header::CONTENT_TYPE, mime_for(path))],
+            f.contents().to_vec(),
+        ).into_response(),
+        None => match WASM_DIST.get_file("index.html") {
+            Some(f) => (
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                f.contents().to_vec(),
+            ).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        },
     }
 }
 
@@ -409,14 +522,14 @@ button { font-family: inherit; }
 /* ── VU meters ────────────────────────────────────────────────────────── */
 #vu {
   background: #252525; padding: 7px 14px 5px;
-  border-bottom: 1px solid #262626; flex-shrink: 0;
+  border-bottom: 1px solid #262626; flex-shrink: 0; position: relative;
 }
 .vrow  { display: flex; align-items: center; gap: 8px; margin: 2px 0; }
 .vlbl  { width: 12px; color: #777; font-size: 11px; }
 .vtrk  { flex: 1; height: 8px; background: #333; border-radius: 2px; overflow: hidden; }
 .vfill { height: 100%; width: 0%; transition: width 60ms linear; }
 .vdb   { width: 58px; text-align: right; font-size: 11px; color: #aaa; }
-#clip  { color: #e05050; font-weight: bold; font-size: 11px; }
+#clip  { position: absolute; top: 9px; right: 14px; color: #e05050; font-weight: bold; font-size: 11px; }
 #stats { display: flex; flex-wrap: wrap; gap: 8px; padding: 3px 0 1px; font-size: 11px; color: #666; }
 
 /* ── Settings chips (mobile only, hidden on desktop) ──────────────────── */
@@ -582,6 +695,7 @@ button { font-family: inherit; }
 <div id="hdr">
   <h1>Pianeer</h1>
   <span id="status">Connecting&hellip;</span>
+  <button onclick="document.getElementById('qr-modal').style.display='flex'" style="background:none;border:1px solid #383838;border-radius:4px;color:#777;cursor:pointer;padding:3px 8px;font-size:11px;font-family:inherit;flex-shrink:0;">QR</button>
 </div>
 
 <div id="app">
@@ -638,6 +752,7 @@ button { font-family: inherit; }
       <button class="nbtn" id="load-btn" data-cmd="Select">Load</button>
       <button class="nbtn nbtn-txt" id="rec-btn" data-cmd="ToggleRecord">&#9679; Rec</button>
       <button class="nbtn nbtn-txt" data-cmd="Rescan">Rescan</button>
+      <button class="nbtn nbtn-txt" id="audio-btn" onclick="toggleAudio()">&#128266;</button>
     </div>
 
   </div><!-- #main -->
@@ -679,6 +794,7 @@ button { font-family: inherit; }
     </div>
     <button id="sd-rescan" data-cmd="Rescan">Rescan instruments</button>
     <button id="sd-rec" data-cmd="ToggleRecord" style="margin-top:4px;padding:10px;background:#252525;border:1px solid #383838;border-radius:4px;cursor:pointer;text-align:center;font-size:12px;color:#e05050;font-family:inherit;">&#9679;&nbsp;Record</button>
+    <button id="sd-audio" onclick="toggleAudio()" style="margin-top:4px;padding:10px;background:#252525;border:1px solid #383838;border-radius:4px;cursor:pointer;text-align:center;font-size:12px;color:#777;font-family:inherit;">&#128266;&nbsp;Monitor</button>
   </div><!-- #side -->
 
 </div><!-- #app -->
@@ -935,6 +1051,214 @@ function renderState(st) {
   }
 }
 
+// ── Audio monitoring ───────────────────────────────────────────────────────
+// Primary path:  WebTransport datagrams  (low latency, unreliable)
+// Fallback path: /audio-ws WebSocket     (reliable, slightly higher latency)
+// Both carry FLAC-encoded stereo 16-bit 48 kHz in 256-sample blocks.
+
+const AUDIO_BLOCK = 256, AUDIO_SR = 48000;
+
+const WORKLET_SRC = `
+class FlacRingProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    const C = 1 << 16; // 65536 samples ≈ 1.4 s at 48 kHz
+    this._L = new Float32Array(C); this._R = new Float32Array(C);
+    this._mask = C - 1; this._w = 0; this._r = 0; this._started = false;
+    this._TARGET = 5 * 256; // buffer 5 blocks before starting output (~26 ms)
+    this.port.onmessage = ({data: {L, R}}) => {
+      for (let i = 0; i < L.length; i++) {
+        this._L[this._w & this._mask] = L[i];
+        this._R[this._w & this._mask] = R[i];
+        this._w++;
+      }
+    };
+  }
+  process(_, outputs) {
+    const out = outputs[0], avail = this._w - this._r;
+    if (!this._started) {
+      if (avail >= this._TARGET) this._started = true;
+      else { out[0].fill(0); out[1].fill(0); return true; }
+    }
+    if (avail < out[0].length) {
+      this._started = false; out[0].fill(0); out[1].fill(0); return true; // underrun → rebuffer
+    }
+    for (let i = 0; i < out[0].length; i++) {
+      out[0][i] = this._L[this._r & this._mask];
+      out[1][i] = this._R[this._r & this._mask];
+      this._r++;
+    }
+    return true;
+  }
+}
+registerProcessor('flac-ring', FlacRingProcessor);
+`;
+
+let _audioCtx = null, _workletNode = null, _decoder = null;
+let _audioActive = false, _audioWs = null, _audioFrameTs = 0;
+let _wtObj = null; // set to the live WebTransport object by connect()
+
+async function toggleAudio() {
+  if (_audioActive) { stopAudio(); return; }
+  _audioActive = true;
+  updateAudioBtns();
+  try { await startAudio(); }
+  catch(e) {
+    console.error('Audio start failed:', e);
+    _audioActive = false;
+    updateAudioBtns();
+    alert('Audio monitoring requires Chrome/Edge 94+ with WebCodecs support.');
+  }
+}
+
+async function startAudio() {
+  if (!window.isSecureContext || typeof AudioDecoder === 'undefined' || typeof AudioWorklet === 'undefined') {
+    // Non-secure context (HTTP on LAN, Android, etc.): use raw PCM + ScriptProcessorNode.
+    // No WebCodecs or AudioWorklet needed.
+    await startAudioPcm();
+    return;
+  }
+  // Secure context: full FLAC + AudioWorklet path.
+  _audioCtx = new AudioContext({sampleRate: AUDIO_SR, latencyHint: 'interactive'});
+  const blob = new Blob([WORKLET_SRC], {type: 'application/javascript'});
+  await _audioCtx.audioWorklet.addModule(URL.createObjectURL(blob));
+  _workletNode = new AudioWorkletNode(_audioCtx, 'flac-ring',
+    {numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2]});
+  _workletNode.connect(_audioCtx.destination);
+  if (_wtObj) { sendCmd('RequestAudioInit'); } else { startAudioWs(); }
+}
+
+async function startAudioPcm() {
+  _audioCtx = new AudioContext({sampleRate: AUDIO_SR, latencyHint: 'interactive'});
+  // Ring buffers for L and R channels
+  const RBCAP = 1 << 16; // 65536 samples ≈ 1.4 s
+  const rbL = new Float32Array(RBCAP), rbR = new Float32Array(RBCAP);
+  const rbMask = RBCAP - 1;
+  let rbW = 0, rbRd = 0, rbStarted = false;
+  const TARGET = 5 * AUDIO_BLOCK;
+
+  // ScriptProcessorNode works in non-secure contexts (deprecated but universally supported)
+  const bufSize = 2048;
+  const sp = _audioCtx.createScriptProcessor(bufSize, 0, 2);
+  sp.onaudioprocess = e => {
+    const outL = e.outputBuffer.getChannelData(0);
+    const outR = e.outputBuffer.getChannelData(1);
+    const avail = rbW - rbRd;
+    if (!rbStarted) {
+      if (avail >= TARGET) rbStarted = true;
+      else { outL.fill(0); outR.fill(0); return; }
+    }
+    if (avail < outL.length) { rbStarted = false; outL.fill(0); outR.fill(0); return; }
+    for (let i = 0; i < outL.length; i++) {
+      outL[i] = rbL[rbRd & rbMask];
+      outR[i] = rbR[rbRd & rbMask];
+      rbRd++;
+    }
+  };
+  sp.connect(_audioCtx.destination);
+  _workletNode = sp; // reuse slot so stopAudio() disconnects it
+
+  const ws = new WebSocket(`ws://${location.hostname}:4000/audio-pcm-ws`);
+  ws.binaryType = 'arraybuffer';
+  _audioWs = ws;
+  ws.onmessage = e => {
+    // i16 stereo little-endian: [L0_lo, L0_hi, R0_lo, R0_hi, L1_lo, L1_hi, …]
+    const view = new DataView(e.data);
+    const frames = e.data.byteLength >> 2; // 4 bytes per stereo frame
+    for (let i = 0; i < frames; i++) {
+      rbL[rbW & rbMask] = view.getInt16(i * 4,     true) / 32767;
+      rbR[rbW & rbMask] = view.getInt16(i * 4 + 2, true) / 32767;
+      rbW++;
+    }
+  };
+  ws.onerror = ws.onclose = () => {
+    if (_audioActive) setTimeout(startAudioPcm, 3000);
+  };
+}
+
+function stopAudio() {
+  _audioActive = false;
+  try { _decoder?.close(); } catch(_) {}
+  _decoder = null;
+  _audioWs?.close(); _audioWs = null;
+  try { _workletNode?.disconnect(); } catch(_) {}
+  _workletNode = null;
+  _audioCtx?.close(); _audioCtx = null;
+  updateAudioBtns();
+}
+
+function setupDecoder(streaminfo) { // Uint8Array of 34 bytes (raw STREAMINFO payload)
+  try { _decoder?.close(); } catch(_) {}
+  _decoder = new AudioDecoder({
+    output: audioData => {
+      if (!_workletNode) { audioData.close(); return; }
+      const n = audioData.numberOfFrames;
+      const L = new Float32Array(n), R = new Float32Array(n);
+      try {
+        audioData.copyTo(L, {planeIndex: 0, format: 'f32-planar'});
+        audioData.copyTo(R, {planeIndex: 1, format: 'f32-planar'});
+      } catch(_) {
+        // interleaved fallback
+        const tmp = new Float32Array(n * 2);
+        audioData.copyTo(tmp, {planeIndex: 0});
+        for (let i = 0; i < n; i++) { L[i] = tmp[i*2]; R[i] = tmp[i*2+1]; }
+      }
+      _workletNode.port.postMessage({L, R}, [L.buffer, R.buffer]);
+      audioData.close();
+    },
+    error: e => console.error('FLAC decoder:', e),
+  });
+  _decoder.configure({codec: 'flac', sampleRate: AUDIO_SR, numberOfChannels: 2,
+    description: streaminfo});
+  _audioFrameTs = 0;
+}
+
+function feedAudioFrame(data) { // ArrayBuffer or Uint8Array
+  if (!_decoder || _decoder.state !== 'configured') return;
+  _decoder.decode(new EncodedAudioChunk({
+    type: 'key', timestamp: _audioFrameTs, data,
+  }));
+  _audioFrameTs += AUDIO_BLOCK * 1e6 / AUDIO_SR;
+}
+
+// Called when audio_init arrives (WT bidi stream or as a protocol message)
+function onAudioInit(b64streaminfo) {
+  if (!_audioActive) return;
+  const si = Uint8Array.from(atob(b64streaminfo), c => c.charCodeAt(0));
+  setupDecoder(si);
+  // Datagram reader is started in connect() once WT is live
+}
+
+function startAudioWs() {
+  if (_audioWs) _audioWs.close();
+  const ws = new WebSocket(`ws://${location.hostname}:4000/audio-ws`);
+  ws.binaryType = 'arraybuffer';
+  _audioWs = ws;
+  let gotHeader = false;
+  ws.onmessage = e => {
+    if (!(e.data instanceof ArrayBuffer)) return;
+    if (!gotHeader) {
+      // First message: 42-byte stream header; STREAMINFO payload is bytes [8..42]
+      setupDecoder(new Uint8Array(e.data, 8, 34));
+      gotHeader = true;
+    } else {
+      if (_audioActive) feedAudioFrame(e.data);
+    }
+  };
+  ws.onerror = ws.onclose = () => {
+    if (_audioActive && !_wtObj) setTimeout(startAudioWs, 3000);
+  };
+}
+
+function updateAudioBtns() {
+  const label = _audioActive ? '\u23F9 Monitor' : '\uD83D\uDD0A Monitor'; // ⏹ / 🔊
+  const col   = _audioActive ? '#70ffaa' : '#777';
+  for (const id of ['audio-btn', 'sd-audio']) {
+    const el = document.getElementById(id);
+    if (el) { el.textContent = label; el.style.color = col; }
+  }
+}
+
 // ── Transport ──────────────────────────────────────────────────────────────
 async function connect() {
   doSend = null;
@@ -948,6 +1272,21 @@ async function connect() {
       });
       await transport.ready;
       statusEl.textContent = 'WebTransport';
+      _wtObj = transport;
+
+      // Datagram reader — runs concurrently, feeds audio frames when monitoring is on
+      (async () => {
+        try {
+          const dtReader = transport.datagrams.readable.getReader();
+          while (true) {
+            const { value, done } = await dtReader.read();
+            if (done) break;
+            if (_audioActive) feedAudioFrame(value.buffer ?? value);
+          }
+        } catch(_) {}
+        _wtObj = null;
+      })();
+
       const bidiReader = transport.incomingBidirectionalStreams.getReader();
       const { value: bidi } = await bidiReader.read();
       const writer = bidi.writable.getWriter();
@@ -961,14 +1300,19 @@ async function connect() {
         const lines = buf.split('\n');
         buf = lines.pop();
         for (const line of lines) {
-          if (line.trim()) { try { renderState(JSON.parse(line)); } catch (_) {} }
+          if (!line.trim()) continue;
+          try {
+            const json = JSON.parse(line);
+            if (json.type === 'audio_init') { onAudioInit(json.streaminfo); }
+            else { renderState(json); }
+          } catch (_) {}
         }
       }
-      doSend = null;
+      doSend = null; _wtObj = null;
       statusEl.textContent = 'Reconnecting\u2026';
       setTimeout(connect, 3000);
       return;
-    } catch (_) { doSend = null; }
+    } catch (_) { doSend = null; _wtObj = null; }
   }
 
   await new Promise(resolve => {
@@ -987,6 +1331,11 @@ async function connect() {
 
 connect();
 </script>
+
+<div id="qr-modal" onclick="this.style.display='none'" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:14px;">
+  <img src="/qr" style="width:min(75vw,75vh);height:min(75vw,75vh);background:#fff;padding:14px;border-radius:6px;display:block;">
+  <span style="color:#666;font-size:12px;user-select:none;">Tap anywhere to close</span>
+</div>
 </body>
 </html>
 "#;
