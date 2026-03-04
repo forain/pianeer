@@ -1,6 +1,6 @@
 # pianeer
 
-A low-latency piano sampler for keyboard instruments. Plays SFZ, Grand Orgue ODF, Kontakt 2, and GIG instruments in response to MIDI input. Runs on Linux, macOS, and Android.
+A low-latency piano sampler for keyboard instruments. Plays SFZ, Grand Orgue ODF, Kontakt 2, and GIG instruments in response to MIDI input. Runs on Linux, macOS, Haiku, and Android.
 
 ## Download
 
@@ -50,7 +50,8 @@ Pre-built binaries are attached to each [GitHub Release](https://github.com/fora
 ### Haiku
 - Haiku R1/beta5 or later (BSoundPlayer for audio, BMidiLocalConsumer for MIDI)
 - A USB MIDI keyboard connected via Haiku's MIDI server
-- Rust toolchain (`pkgman install rust`) + GCC (for C++ shim compilation)
+- Rust **nightly** toolchain (`pkgman install rust`) + GCC (for C++ shim compilation)
+- `x86_64-unknown-haiku` is a Tier 3 target — `std` must be compiled from source (`-Z build-std`)
 
 ### Android
 - Android 10+ (API 30+) — requires MANAGE_EXTERNAL_STORAGE permission
@@ -69,8 +70,8 @@ cargo build --release -p pianeer --features native-ui
 # WASM web UI (trunk required)
 cd web-wasm && trunk build --release
 
-# Haiku (native, in Haiku Terminal)
-cargo build --release -p pianeer
+# Haiku (native, in Haiku Terminal — nightly required, x86_64-unknown-haiku is Tier 3)
+cargo +nightly build --release -p pianeer -Z build-std=std,panic_abort --target x86_64-unknown-haiku
 
 # Android APK (NDK r29 required)
 cargo apk build --release -p pianeer-android
@@ -181,7 +182,7 @@ Pianeer is a Cargo workspace:
 | Crate | Role |
 |-------|------|
 | `core` (`pianeer-core`) | Sampler engine, all parsers, MIDI, types, web server — no platform I/O |
-| `desktop` (`pianeer`) | JACK/CoreAudio binary: terminal UI and optional native egui window |
+| `desktop` (`pianeer`) | JACK (Linux) / CoreAudio (macOS) / BSoundPlayer (Haiku) binary: terminal UI and optional native egui window |
 | `egui-app` (`pianeer-egui`) | Shared eframe `App` used by desktop (native-ui) and Android |
 | `web-wasm` (`pianeer-wasm`) | WASM build of the egui UI, served by the embedded web server |
 | `android` (`pianeer-android`) | Android NDK cdylib: Oboe audio + egui via android-activity |
@@ -203,7 +204,7 @@ Pianeer is a Cargo workspace:
 | `core/src/midi_recorder.rs` | MIDI recording to SMF Type-0 `.mid` |
 | `core/src/types.rs` | `MenuItem`, `MenuAction`, `Settings`, `PlaybackState`, `ProcStats` |
 | `core/src/snapshot.rs` | `WebSnapshot`, `ClientCmd`, `build_snapshot()` |
-| `core/src/sys_stats.rs` | CPU and memory stats (Linux `/proc` and macOS `getrusage`) |
+| `core/src/sys_stats.rs` | CPU and memory stats (Linux `/proc`, macOS/Haiku `getrusage`) |
 | `core/src/web.rs` | Axum HTTP + WebTransport server, serves embedded WASM UI |
 | `core/src/audio_stream.rs` | Lock-free ring buffer → FLAC encoder for audio streaming |
 
@@ -215,5 +216,8 @@ Pianeer is a Cargo workspace:
 | `desktop/src/terminal.rs` | Raw-mode terminal loop (`run_terminal`) |
 | `desktop/src/gui.rs` | Native egui window path (`run_native_ui`, `--features native-ui`) |
 | `desktop/src/ui.rs` | Terminal rendering: `print_menu`, VU meter, seekbar, QR modal |
-| `desktop/src/audio.rs` | Platform audio dispatch: JACK/PipeWire (Linux) and CoreAudio (macOS) |
-| `desktop/src/midi.rs` | MIDI input thread (midir) |
+| `desktop/src/audio.rs` | Platform audio dispatch: JACK/PipeWire (Linux), CoreAudio (macOS), BSoundPlayer (Haiku) |
+| `desktop/src/midi.rs` | MIDI input: midir/ALSA (Linux), midir/CoreMIDI (macOS), BMidiLocalConsumer (Haiku) |
+| `desktop/src/haiku_audio.cpp` | C shim wrapping BSoundPlayer for Rust FFI |
+| `desktop/src/haiku_midi.cpp` | C++ shim wrapping BMidiLocalConsumer / BMidiRoster for Rust FFI |
+| `desktop/build.rs` | Compiles Haiku C++ shims via the `cc` crate when targeting Haiku |
