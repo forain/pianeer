@@ -236,24 +236,24 @@ pub fn load_instrument_data(inst: &Instrument) -> Result<LoadedInstrument, Strin
     let (regions, cc_defaults, sw_lokey, sw_hikey, sw_default) = match ext.as_str() {
         "sfz" => {
             println!("Parsing SFZ: {}", inst.path().display());
-            let (regions, meta) = crate::sfz::parse_sfz(inst.path())
+            let (regions, meta) = crate::parsers::sfz::parse_sfz(inst.path())
                 .map_err(|e| format!("Error parsing SFZ: {}", e))?;
             (regions, meta.cc_defaults, meta.sw_lokey, meta.sw_hikey, meta.sw_default)
         }
         "organ" => {
             println!("Parsing Grand Orgue ODF: {}", inst.path().display());
-            let regions = crate::organ::parse_organ(inst.path())
+            let regions = crate::parsers::organ::parse_organ(inst.path())
                 .map_err(|e| format!("Error parsing ODF: {}", e))?;
             (regions, [0u8; 128], 0u8, 0u8, None)
         }
         "nki" | "nkm" => {
             println!("Parsing Kontakt instrument: {}", inst.path().display());
-            let regions = crate::kontakt::parse_kontakt(inst.path())
+            let regions = crate::parsers::kontakt::parse_kontakt(inst.path())
                 .map_err(|e| format!("Error parsing NKI/NKM: {}", e))?;
             (regions, [0u8; 128], 0u8, 0u8, None)
         }
         "gig" => {
-            let (regions, samples) = crate::gig::parse_gig(inst.path())
+            let (regions, samples) = crate::parsers::gig::parse_gig(inst.path())
                 .map_err(|e| format!("Error parsing GIG: {}", e))?;
             println!("All samples loaded.");
             return Ok(LoadedInstrument {

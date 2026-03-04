@@ -2410,22 +2410,20 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pianeer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "cc",
  "cpal",
  "crossbeam-channel",
  "crossterm",
  "eframe",
- "flacenc",
  "flate2",
- "hound",
  "jack",
  "libc",
  "midir",
  "pianeer-core",
  "pianeer-egui",
  "qrcode",
- "rayon",
  "ringbuf",
  "serde",
  "serde_json",
@@ -2434,7 +2432,7 @@ dependencies = [
 
 [[package]]
 name = "pianeer-android"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "android-activity",
  "android_logger",
@@ -2453,12 +2451,13 @@ dependencies = [
 
 [[package]]
 name = "pianeer-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "crossbeam-channel",
  "flate2",
  "include_dir",
+ "libc",
  "midly",
  "qrcode",
  "ringbuf",
@@ -2472,7 +2471,7 @@ dependencies = [
 
 [[package]]
 name = "pianeer-egui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "eframe",
@@ -2490,7 +2489,7 @@ dependencies = [
 
 [[package]]
 name = "pianeer-wasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "pianeer-egui",
@@ -3845,6 +3844,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75a326b8c223ee17883a4251907455a2431acc2791c98c26279376490c378c16"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wav2flac"
+version = "0.2.0"
+dependencies = [
+ "flacenc",
+ "hound",
+ "rayon",
 ]
 
 [[package]]

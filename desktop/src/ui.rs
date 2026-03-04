@@ -1,53 +1,9 @@
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 use crossterm::terminal;
 
-pub use pianeer_core::types::{
-    MenuItem, MenuAction, PlaybackInfo, ProcStats,
-    Settings, VeltrackLevel, TunePreset,
-};
-
-// ── Playback state (desktop — owns the JoinHandle) ────────────────────────────
-
-pub struct PlaybackState {
-    pub stop:       Arc<AtomicBool>,
-    pub done:       Arc<AtomicBool>,
-    pub paused:     Arc<AtomicBool>,
-    pub current_us: Arc<AtomicU64>,
-    pub total_us:   u64,
-    pub seek_to:    Arc<AtomicU64>,
-    pub _handle:    thread::JoinHandle<()>,
-    pub menu_idx:   usize,
-}
-
-impl PlaybackState {
-    pub fn info(&self) -> PlaybackInfo {
-        PlaybackInfo {
-            current_us: self.current_us.load(Ordering::Relaxed),
-            total_us:   self.total_us,
-            paused:     self.paused.load(Ordering::Relaxed),
-            menu_idx:   self.menu_idx,
-        }
-    }
-}
-
-// ── Playback helpers ──────────────────────────────────────────────────────────
-
-pub fn stop_playback(pb: &mut Option<PlaybackState>) {
-    if let Some(p) = pb.take() {
-        p.stop.store(true, Ordering::Relaxed);
-    }
-}
-
-pub fn playing_idx(pb: &Option<PlaybackState>) -> Option<usize> {
-    pb.as_ref()
-        .filter(|p| !p.done.load(Ordering::Relaxed))
-        .map(|p| p.menu_idx)
-}
+use pianeer_core::types::{MenuItem, PlaybackInfo, ProcStats, Settings};
 
 // ── VU bar ────────────────────────────────────────────────────────────────────
 

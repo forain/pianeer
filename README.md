@@ -1,6 +1,6 @@
 # pianeer
 
-A low-latency piano sampler for keyboard instruments. Plays SFZ, Grand Orgue ODF, Kontakt 2, and GIG instruments in response to MIDI input.
+A low-latency piano sampler for keyboard instruments. Plays SFZ, Grand Orgue ODF, Kontakt 2, and GIG instruments in response to MIDI input. Runs on Linux, macOS, and Android.
 
 ## Download
 
@@ -11,10 +11,12 @@ Pre-built binaries are attached to each [GitHub Release](https://github.com/fora
 | `pianeer-macos-universal` | macOS — Intel and Apple Silicon (universal binary) |
 | `pianeer-linux-amd64` | Linux x86_64 |
 | `pianeer-linux-arm64` | Linux arm64 (Raspberry Pi OS 64-bit) |
+| `pianeer-android.apk` | Android arm64 |
+| `pianeer-haiku-amd64` | Haiku x86_64 |
 
 ## Features
 
-- Real-time stereo audio via JACK/PipeWire (Linux) or CoreAudio (macOS)
+- Real-time stereo audio via JACK/PipeWire (Linux), CoreAudio (macOS), BSoundPlayer (Haiku), or Oboe/AAudio (Android)
 - SFZ v2/ARIA format with full `<global>` → `<master>` → `<group>` → `<region>` inheritance
 - Grand Orgue ODF format (`.organ` files)
 - Kontakt 2 format (`.nki` / `.nkm` files)
@@ -29,6 +31,8 @@ Pre-built binaries are attached to each [GitHub Release](https://github.com/fora
 - 8 real-time playback controls: velocity tracking, tuning, release, volume, transpose, variant, resonance, sustain
 - VU meter with clip detection and CPU/memory stats
 - Web UI with WebTransport (falls back to WebSocket) — reachable at `https://localhost:4000`
+- egui native window (optional — `--features native-ui`)
+- egui web interface (WASM, served from the same port)
 
 ## Requirements
 
@@ -43,10 +47,36 @@ Pre-built binaries are attached to each [GitHub Release](https://github.com/fora
 - A MIDI keyboard connected via USB or Core MIDI
 - Rust toolchain + Xcode Command Line Tools for building
 
+### Haiku
+- Haiku R1/beta5 or later (BSoundPlayer for audio, BMidiLocalConsumer for MIDI)
+- A USB MIDI keyboard connected via Haiku's MIDI server
+- Rust toolchain (`pkgman install rust`) + GCC (for C++ shim compilation)
+
+### Android
+- Android 10+ (API 30+) — requires MANAGE_EXTERNAL_STORAGE permission
+- Place instruments under `/sdcard/Pianeer/samples/` and MIDI files under `/sdcard/Pianeer/midi/`
+- Built with cargo-apk; no Java/Kotlin required
+
 ## Building
 
 ```bash
-cargo build --release
+# Desktop (terminal UI, default)
+cargo build --release -p pianeer
+
+# Desktop with native egui window
+cargo build --release -p pianeer --features native-ui
+
+# WASM web UI (trunk required)
+cd web-wasm && trunk build --release
+
+# Haiku (native, in Haiku Terminal)
+cargo build --release -p pianeer
+
+# Android APK (NDK r29 required)
+cargo apk build --release -p pianeer-android
+
+# WAV → FLAC batch converter
+cargo build --release -p wav2flac
 ```
 
 ## Running
@@ -59,6 +89,16 @@ pw-jack ./target/release/pianeer
 **macOS** — run directly:
 ```bash
 ./target/release/pianeer
+```
+
+**Haiku** — run directly:
+```bash
+./target/release/pianeer
+```
+
+**Native egui window** (Linux or macOS):
+```bash
+pw-jack ./target/release/pianeer  # Linux, after building with --features native-ui
 ```
 
 Instruments are discovered automatically from a `samples/` directory next to the binary (or in the working directory). Place each instrument in its own subdirectory:
@@ -92,6 +132,7 @@ samples/
 | W | Start / stop MIDI recording |
 | Space | Pause / resume MIDI playback |
 | , / . | Seek MIDI playback ±10 s |
+| P | Show QR code for web UI |
 | Q / Ctrl+C | Quit |
 
 ## Format support
@@ -135,20 +176,44 @@ Binary `.nki` / `.nkm` files with a zlib-compressed XML payload. Three-level hie
 
 ## Architecture
 
-| File | Role |
-|------|------|
-| `src/main.rs` | Entry point: instrument discovery, audio setup, input loop, system stats |
-| `src/audio.rs` | Platform audio dispatch: JACK/PipeWire (Linux) and CoreAudio via cpal (macOS) |
-| `src/sampler.rs` | Real-time voice engine |
-| `src/loader.rs` | Parallel sample loading, WAV fixup, sample-rate probing |
-| `src/instruments.rs` | `samples/` directory scanning (1–2 levels deep) |
-| `src/ui.rs` | Terminal menu rendering, VU meter, playback controls |
-| `src/web.rs` | Web UI server — WebTransport (QUIC) with WebSocket fallback |
-| `src/midi.rs` | MIDI input thread (midir — CoreMIDI on macOS, ALSA on Linux) |
-| `src/midi_player.rs` | MIDI file playback thread (midly) |
-| `src/midi_recorder.rs` | MIDI recording to `.mid` file |
-| `src/sfz.rs` | SFZ parser with `#include`/`#define` expansion |
-| `src/organ.rs` | Grand Orgue ODF parser |
-| `src/kontakt.rs` | Kontakt 2 NKI/NKM parser |
-| `src/gig.rs` | GIG/DLS binary parser |
-| `src/region.rs` | Shared `Region` type |
+Pianeer is a Cargo workspace:
+
+| Crate | Role |
+|-------|------|
+| `core` (`pianeer-core`) | Sampler engine, all parsers, MIDI, types, web server — no platform I/O |
+| `desktop` (`pianeer`) | JACK/CoreAudio binary: terminal UI and optional native egui window |
+| `egui-app` (`pianeer-egui`) | Shared eframe `App` used by desktop (native-ui) and Android |
+| `web-wasm` (`pianeer-wasm`) | WASM build of the egui UI, served by the embedded web server |
+| `android` (`pianeer-android`) | Android NDK cdylib: Oboe audio + egui via android-activity |
+| `tools/wav2flac` | Standalone WAV → FLAC batch converter |
+
+### Core modules
+
+| Module | Role |
+|--------|------|
+| `core/src/sampler.rs` | Real-time voice engine (`SamplerState`) |
+| `core/src/loader.rs` | Parallel sample loading, WAV fixup, sample-rate probing |
+| `core/src/parsers/sfz.rs` | SFZ parser with `#include`/`#define` expansion |
+| `core/src/parsers/organ.rs` | Grand Orgue ODF parser |
+| `core/src/parsers/kontakt.rs` | Kontakt 2 NKI/NKM parser |
+| `core/src/parsers/gig.rs` | GIG/DLS binary parser |
+| `core/src/region.rs` | Shared `Region` type output by all parsers |
+| `core/src/instruments.rs` | `samples/` directory scanning |
+| `core/src/midi_player.rs` | MIDI file playback thread (midly) |
+| `core/src/midi_recorder.rs` | MIDI recording to SMF Type-0 `.mid` |
+| `core/src/types.rs` | `MenuItem`, `MenuAction`, `Settings`, `PlaybackState`, `ProcStats` |
+| `core/src/snapshot.rs` | `WebSnapshot`, `ClientCmd`, `build_snapshot()` |
+| `core/src/sys_stats.rs` | CPU and memory stats (Linux `/proc` and macOS `getrusage`) |
+| `core/src/web.rs` | Axum HTTP + WebTransport server, serves embedded WASM UI |
+| `core/src/audio_stream.rs` | Lock-free ring buffer → FLAC encoder for audio streaming |
+
+### Desktop modules
+
+| Module | Role |
+|--------|------|
+| `desktop/src/main.rs` | Startup: instrument discovery, audio setup, channels |
+| `desktop/src/terminal.rs` | Raw-mode terminal loop (`run_terminal`) |
+| `desktop/src/gui.rs` | Native egui window path (`run_native_ui`, `--features native-ui`) |
+| `desktop/src/ui.rs` | Terminal rendering: `print_menu`, VU meter, seekbar, QR modal |
+| `desktop/src/audio.rs` | Platform audio dispatch: JACK/PipeWire (Linux) and CoreAudio (macOS) |
+| `desktop/src/midi.rs` | MIDI input thread (midir) |

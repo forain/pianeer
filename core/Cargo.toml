@@ -1,6 +1,6 @@
 [package]
 name = "pianeer-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [features]
@@ -20,3 +20,9 @@ wtransport   = { version = "0.7", features = ["self-signed"], optional = true }
 tokio        = { version = "1", features = ["full"], optional = true }
 qrcode       = { version = "0.14", optional = true }
 include_dir  = { version = "0.7", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "haiku")'.dependencies]
+libc = "0.2"

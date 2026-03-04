@@ -1,8 +1,5 @@
 pub mod region;
-pub mod sfz;
-pub mod organ;
-pub mod kontakt;
-pub mod gig;
+pub mod parsers;
 pub mod sampler;
 pub mod loader;
 pub mod instruments;
@@ -10,5 +7,6 @@ pub mod midi_player;
 pub mod midi_recorder;
 pub mod types;
 pub mod snapshot;
+pub mod sys_stats;
 #[cfg(feature = "web")] pub mod audio_stream;
 #[cfg(feature = "web")] pub mod web;

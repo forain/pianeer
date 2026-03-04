@@ -209,10 +209,69 @@ mod cpal_impl {
     }
 }
 
+// ── Haiku / BSoundPlayer ──────────────────────────────────────────────────────
+
+#[cfg(target_os = "haiku")]
+mod haiku_impl {
+    use std::sync::{Arc, Mutex};
+
+    use pianeer_core::sampler::SamplerState;
+
+    extern "C" {
+        fn haiku_player_create(
+            fill_fn: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, usize),
+            cookie: *mut std::ffi::c_void,
+            desired_rate: u32,
+            out_rate: *mut u32,
+        ) -> *mut std::ffi::c_void;
+        fn haiku_player_start(handle: *mut std::ffi::c_void);
+        fn haiku_player_stop(handle: *mut std::ffi::c_void);
+        fn haiku_player_destroy(handle: *mut std::ffi::c_void);
+    }
+
+    struct CbState { sampler: Arc<Mutex<SamplerState>> }
+
+    unsafe extern "C" fn fill_cb(cookie: *mut std::ffi::c_void, buf: *mut std::ffi::c_void, size: usize) {
+        let state = &*(cookie as *const CbState);
+        let frames = size / (2 * std::mem::size_of::<f32>());
+        let out = std::slice::from_raw_parts_mut(buf as *mut f32, frames * 2);
+        let mut l = vec![0f32; frames];
+        let mut r = vec![0f32; frames];
+        if let Ok(ref mut s) = state.sampler.try_lock() { s.process(&mut l, &mut r); }
+        for i in 0..frames { out[i * 2] = l[i]; out[i * 2 + 1] = r[i]; }
+    }
+
+    pub struct HaikuProbe { pub sample_rate: u32 }
+
+    pub fn probe(probed_rate: Option<u32>) -> Result<HaikuProbe, String> {
+        Ok(HaikuProbe { sample_rate: probed_rate.unwrap_or(44100) })
+    }
+
+    pub struct HaikuActive { player: *mut std::ffi::c_void, _state: Box<CbState> }
+    unsafe impl Send for HaikuActive {}
+
+    pub fn start(probe: HaikuProbe, state: Arc<Mutex<SamplerState>>) -> Result<HaikuActive, String> {
+        let cb = Box::new(CbState { sampler: state });
+        let cookie = &*cb as *const CbState as *mut std::ffi::c_void;
+        let mut actual = probe.sample_rate;
+        let player = unsafe { haiku_player_create(fill_cb, cookie, probe.sample_rate, &mut actual) };
+        if player.is_null() { return Err("BSoundPlayer creation failed".to_string()); }
+        unsafe { haiku_player_start(player); }
+        println!("Haiku BSoundPlayer started at {} Hz", actual);
+        Ok(HaikuActive { player, _state: cb })
+    }
+
+    impl Drop for HaikuActive {
+        fn drop(&mut self) {
+            unsafe { haiku_player_stop(self.player); haiku_player_destroy(self.player); }
+        }
+    }
+}
+
 // ── Unsupported platforms ─────────────────────────────────────────────────────
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("Unsupported platform: only Linux (JACK) and macOS (CoreAudio) are supported.");
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "haiku")))]
+compile_error!("Unsupported platform: Linux (JACK), macOS (CoreAudio), and Haiku (BSoundPlayer) are supported.");
 
 // ── Platform type aliases ─────────────────────────────────────────────────────
 
@@ -220,11 +279,15 @@ compile_error!("Unsupported platform: only Linux (JACK) and macOS (CoreAudio) ar
 type ProbeInner = jack_impl::JackProbe;
 #[cfg(target_os = "macos")]
 type ProbeInner = cpal_impl::CpalProbe;
+#[cfg(target_os = "haiku")]
+type ProbeInner = haiku_impl::HaikuProbe;
 
 #[cfg(target_os = "linux")]
 type ActiveInner = jack_impl::JackActive;
 #[cfg(target_os = "macos")]
 type ActiveInner = cpal_impl::CpalActive;
+#[cfg(target_os = "haiku")]
+type ActiveInner = haiku_impl::HaikuActive;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -250,6 +313,8 @@ pub fn probe_audio(probed_rate: Option<u32>) -> Result<AudioProbe, String> {
     let inner = jack_impl::probe(probed_rate)?;
     #[cfg(target_os = "macos")]
     let inner = cpal_impl::probe(probed_rate)?;
+    #[cfg(target_os = "haiku")]
+    let inner = haiku_impl::probe(probed_rate)?;
 
     let sample_rate = inner.sample_rate;
     Ok(AudioProbe { sample_rate, inner })
@@ -266,6 +331,8 @@ pub fn start_audio(
     let inner = jack_impl::start(probe.inner, state)?;
     #[cfg(target_os = "macos")]
     let inner = cpal_impl::start(probe.inner, state)?;
+    #[cfg(target_os = "haiku")]
+    let inner = haiku_impl::start(probe.inner, state)?;
 
     Ok(ActiveAudio { _inner: inner })
 }
