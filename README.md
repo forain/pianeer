@@ -221,3 +221,22 @@ Pianeer is a Cargo workspace:
 | `desktop/src/haiku_audio.cpp` | C shim wrapping BSoundPlayer for Rust FFI |
 | `desktop/src/haiku_midi.cpp` | C++ shim wrapping BMidiLocalConsumer / BMidiRoster for Rust FFI |
 | `desktop/build.rs` | Compiles Haiku C++ shims via the `cc` crate when targeting Haiku |
+
+### egui-app modules
+
+| Module | Role |
+|--------|------|
+| `egui-app/src/app.rs` | `PianeerApp` — eframe `App` impl; renders stats/VU bar, settings panel (landscape) or drawer (portrait), scrollable instrument/MIDI list, QR popup |
+| `egui-app/src/backend.rs` | `PianeerBackend` trait; `LocalBackend` (reads `Arc<Mutex<String>>` snapshot, sends `MenuAction` — used by desktop native-ui and Android); `RemoteBackend` (native: ewebsock WS; WASM: WebTransport with WS fallback) |
+
+### web-wasm modules
+
+| Module | Role |
+|--------|------|
+| `web-wasm/src/main.rs` | WASM entry point; derives WebSocket URL from the page origin, constructs `RemoteBackend`, mounts `PianeerApp` onto `#pianeer_canvas` via `eframe::WebRunner` |
+
+### Android modules
+
+| Module | Role |
+|--------|------|
+| `android/src/lib.rs` | NDK `cdylib` entry point; Oboe (AAudio/OpenSL ES) audio stream, JNI storage-permission gate, action dispatch + snapshot loop (mirrors `run_native_ui`), MIDI playback, web server, eframe UI via `android-activity` |
