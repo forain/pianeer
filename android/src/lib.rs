@@ -236,12 +236,19 @@ fn android_main(android_app: android_activity::AndroidApp) {
         Arc::clone(&audio_handle),
     );
 
+    // ── Shared MIDI recorder handle ───────────────────────────────────────────
+    let record_handle = midi_recorder::new_handle();
+
+    // ── Android MIDI API input (MidiManager; auto-reconnects) ─────────────────
+    spawn_midi_api_thread(android_app.clone(), midi_tx.clone(), record_handle.clone());
+
     // ── Background: action dispatch + snapshot + instrument loading ───────────
     {
         let state      = Arc::clone(&state);
         let snap       = snap_for_loop;
         let app_bg     = android_app.clone();
         let midi_tx_bg = midi_tx.clone();
+        let record_handle = record_handle;
 
         thread::spawn(move || {
             // auto_tune correction detected after each instrument load.
@@ -254,7 +261,6 @@ fn android_main(android_app: android_activity::AndroidApp) {
             let mut current         = 0usize;
             let mut current_path    = std::path::PathBuf::new();
             let mut playback: Option<PlaybackState> = None;
-            let record_handle       = midi_recorder::new_handle();
             let mut storage_ready   = false;
             let mut perm_requested  = false;
             let mut prev_cpu_ticks  = read_cpu_ticks().unwrap_or(0);
@@ -532,6 +538,267 @@ fn android_main(android_app: android_activity::AndroidApp) {
     .unwrap_or_else(|e| log::error!("eframe error: {e}"));
 }
 
+// ── Android MIDI API input ────────────────────────────────────────────────────
+
+/// Write a timestamped line to /sdcard/Pianeer/midi_debug.log (readable even
+/// when logcat is unreachable over wireless ADB).
+fn midi_log(msg: &str) {
+    use std::io::Write;
+    log::info!("midi: {}", msg);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open("/sdcard/Pianeer/midi_debug.log")
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{ts}] {msg}");
+    }
+}
+
+/// Parse raw MIDI bytes (as delivered by the Android MIDI API) into MidiEvents.
+/// Each call receives one or more complete MIDI messages concatenated.
+fn parse_midi_bytes(data: &[u8]) -> Vec<MidiEvent> {
+    let mut events = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let status = data[i];
+        if status & 0x80 == 0 { i += 1; continue; } // ignore running-status bytes
+        let msg_type = status & 0xF0;
+        let channel  = status & 0x0F;
+        match msg_type {
+            0x80 if i + 2 < data.len() => {
+                events.push(MidiEvent::NoteOff { channel, note: data[i + 1] & 0x7F });
+                i += 3;
+            }
+            0x90 if i + 2 < data.len() => {
+                let note = data[i + 1] & 0x7F;
+                let vel  = data[i + 2] & 0x7F;
+                if vel == 0 {
+                    events.push(MidiEvent::NoteOff { channel, note });
+                } else {
+                    events.push(MidiEvent::NoteOn { channel, note, velocity: vel });
+                }
+                i += 3;
+            }
+            0xB0 if i + 2 < data.len() => {
+                let ctl = data[i + 1] & 0x7F;
+                let val = data[i + 2] & 0x7F;
+                if ctl == 123 || ctl == 120 {
+                    events.push(MidiEvent::AllNotesOff);
+                } else if ctl != 1 {
+                    events.push(MidiEvent::ControlChange { channel, controller: ctl, value: val });
+                }
+                i += 3;
+            }
+            0xF0 => { // SysEx — skip to 0xF7
+                while i < data.len() && data[i] != 0xF7 { i += 1; }
+                i += 1;
+            }
+            0xFE => { i += 1; } // Active Sensing — ignore
+            _    => { i += 1; }
+        }
+    }
+    events
+}
+
+/// Spawn a thread that connects to a MIDI device via the Android MIDI API
+/// (MidiManager) and forwards events to the sampler.  Auto-reconnects every
+/// 2 seconds after unplug.  Uses custom Java helpers (MidiHelper / MidiQueue)
+/// injected as classes2.dex.
+#[cfg(target_os = "android")]
+fn spawn_midi_api_thread(
+    app:    android_activity::AndroidApp,
+    tx:     crossbeam_channel::Sender<MidiEvent>,
+    record: pianeer_core::midi_recorder::RecordHandle,
+) {
+    use jni::objects::{JByteArray, JClass, JObject, JValueGen};
+    use jni::JavaVM;
+
+    thread::spawn(move || {
+        let vm = match unsafe { JavaVM::from_raw(app.vm_as_ptr() as *mut _) } {
+            Ok(v) => v,
+            Err(e) => { midi_log(&format!("JavaVM error: {e:?}")); return; }
+        };
+        let activity_ptr = app.activity_as_ptr();
+        midi_log("midi_api thread started");
+
+        let mut poll_n: u32 = 0;
+        loop {
+            thread::sleep(Duration::from_secs(2));
+            poll_n += 1;
+            midi_log(&format!("poll #{poll_n}"));
+
+            // ── Try to open a MIDI device via MidiHelper.connect() ────────────
+            let queue_gref: Option<jni::objects::GlobalRef> = (|| -> Option<jni::objects::GlobalRef> {
+                let mut env = vm.attach_current_thread()
+                    .map_err(|e| midi_log(&format!("attach: {e:?}"))).ok()?;
+                let activity = unsafe { JObject::from_raw(activity_ptr as *mut _) };
+
+                // Build a DexClassLoader that reads classes.dex directly from
+                // our APK.  We cannot use activity.getClassLoader() because
+                // NativeActivity apps have an empty DexPathList — ART never
+                // runs dex2oat for them since the original APK has no Java code.
+                let apk_path = env.call_method(
+                    &activity, "getPackageCodePath",
+                    "()Ljava/lang/String;", &[],
+                ).map_err(|e| midi_log(&format!("getPackageCodePath: {e:?}"))).ok()?.l().ok()?;
+
+                // getCodeCacheDir() → optimized-dex output dir (API 21+)
+                let code_cache_file = env.call_method(
+                    &activity, "getCodeCacheDir",
+                    "()Ljava/io/File;", &[],
+                ).ok()?.l().ok()?;
+                let cache_path = env.call_method(
+                    &code_cache_file, "getAbsolutePath",
+                    "()Ljava/lang/String;", &[],
+                ).ok()?.l().ok()?;
+
+                let parent_loader = env.call_method(
+                    &activity, "getClassLoader",
+                    "()Ljava/lang/ClassLoader;", &[],
+                ).ok()?.l().ok()?;
+
+                let dcl_class = env.find_class("dalvik/system/DexClassLoader")
+                    .map_err(|e| midi_log(&format!("find DexClassLoader: {e:?}"))).ok()?;
+                let null_str = JObject::null();
+                let loader = env.new_object(
+                    &dcl_class,
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;\
+                      Ljava/lang/ClassLoader;)V",
+                    &[
+                        JValueGen::Object(&apk_path),
+                        JValueGen::Object(&cache_path),
+                        JValueGen::Object(&null_str),
+                        JValueGen::Object(&parent_loader),
+                    ],
+                ).map_err(|e| midi_log(&format!("new DexClassLoader: {e:?}"))).ok()?;
+
+                let cls_name = env.new_string("com.pianeer.app.MidiHelper").ok()?;
+                let cls_obj = env.call_method(
+                    &loader, "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[JValueGen::Object(&cls_name)],
+                ).map_err(|e| midi_log(&format!("loadClass MidiHelper: {e:?}"))).ok()?.l().ok()?;
+                if cls_obj.is_null() {
+                    midi_log("MidiHelper class not found — was classes.dex injected?");
+                    return None;
+                }
+                let cls = unsafe { JClass::from_raw(cls_obj.into_raw()) };
+
+                // MidiHelper.connect(Context) -> MidiQueue
+                let queue_obj = env.call_static_method(
+                    &cls, "connect",
+                    "(Landroid/content/Context;)Lcom/pianeer/app/MidiQueue;",
+                    &[JValueGen::Object(&activity)],
+                ).map_err(|e| midi_log(&format!("MidiHelper.connect: {e:?}"))).ok()?.l().ok()?;
+
+                if queue_obj.is_null() {
+                    midi_log("no MIDI device with output port found");
+                    return None;
+                }
+                let gref = env.new_global_ref(&queue_obj)
+                    .map_err(|e| midi_log(&format!("new_global_ref: {e:?}"))).ok()?;
+                midi_log("MIDI device connected via Android MIDI API");
+                Some(gref)
+            })();
+
+            let queue_gref = match queue_gref {
+                Some(q) => q,
+                None    => continue,
+            };
+
+            // ── Inner loop: poll MidiQueue every 100 ms ───────────────────────
+            let mut iter: u32 = 0;
+            loop {
+                iter += 1;
+
+                let result = (|| -> Option<Option<Vec<u8>>> {
+                    let mut env = vm.attach_current_thread().ok()?;
+
+                    // Every 20 iterations (~2 s) check if the device is still present.
+                    if iter % 20 == 0 {
+                        let activity = unsafe { JObject::from_raw(activity_ptr as *mut _) };
+                        let apk_path = env.call_method(&activity, "getPackageCodePath", "()Ljava/lang/String;", &[]).ok()?.l().ok()?;
+                        let code_cache_file = env.call_method(&activity, "getCodeCacheDir", "()Ljava/io/File;", &[]).ok()?.l().ok()?;
+                        let cache_path = env.call_method(&code_cache_file, "getAbsolutePath", "()Ljava/lang/String;", &[]).ok()?.l().ok()?;
+                        let parent_loader = env.call_method(&activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[]).ok()?.l().ok()?;
+                        let dcl_class = env.find_class("dalvik/system/DexClassLoader").ok()?;
+                        let null_str = JObject::null();
+                        let loader = env.new_object(&dcl_class,
+                            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassLoader;)V",
+                            &[JValueGen::Object(&apk_path), JValueGen::Object(&cache_path), JValueGen::Object(&null_str), JValueGen::Object(&parent_loader)],
+                        ).ok()?;
+                        let cls_name = env.new_string("com.pianeer.app.MidiHelper").ok()?;
+                        let cls_obj = env.call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;",
+                            &[JValueGen::Object(&cls_name)]).ok()?.l().ok()?;
+                        let cls = unsafe { JClass::from_raw(cls_obj.into_raw()) };
+                        let present = env.call_static_method(
+                            &cls, "isAnyDevicePresent",
+                            "(Landroid/content/Context;)Z",
+                            &[JValueGen::Object(&activity)],
+                        ).ok()?.z().ok()?;
+                        if !present {
+                            midi_log("MIDI device no longer present — reconnecting");
+                            return None; // signals outer loop to close + retry
+                        }
+                    }
+
+                    // queue.poll(100L) -> byte[] or null
+                    let bytes_obj = env.call_method(
+                        queue_gref.as_obj(), "poll", "(J)[B",
+                        &[JValueGen::Long(100)],
+                    ).map_err(|e| {
+                        if env.exception_check().unwrap_or(false) {
+                            let _ = env.exception_clear();
+                        }
+                        midi_log(&format!("queue.poll exception: {e:?}"));
+                    }).ok()?.l().ok()?;
+
+                    if bytes_obj.is_null() {
+                        return Some(None); // timeout, no data
+                    }
+
+                    let j_arr = unsafe { JByteArray::from_raw(bytes_obj.into_raw()) };
+                    let len   = env.get_array_length(&j_arr).ok()? as usize;
+                    let mut buf = vec![0i8; len];
+                    env.get_byte_array_region(&j_arr, 0, &mut buf).ok()?;
+                    let data: Vec<u8> = buf.iter().map(|&b| b as u8).collect();
+                    Some(Some(data))
+                })();
+
+                match result {
+                    None => break, // JNI error or device gone — reconnect
+                    Some(None) => {} // poll timeout — keep looping
+                    Some(Some(data)) => {
+                        midi_log(&format!("rx {} bytes: {:02x?}", data.len(), &data));
+                        let events = parse_midi_bytes(&data);
+                        midi_log(&format!("parsed {} events: {:?}", events.len(), &events));
+                        for ev in events {
+                            if let Ok(mut g) = record.lock() {
+                                if let Some(ref mut buf) = *g {
+                                    buf.events.push((buf.start.elapsed(), ev.clone()));
+                                }
+                            }
+                            let _ = tx.send(ev);
+                        }
+                    }
+                }
+            }
+
+            // ── Close queue before reconnect attempt ──────────────────────────
+            if let Ok(mut env) = vm.attach_current_thread() {
+                let _ = env.call_method(queue_gref.as_obj(), "close", "()V", &[]);
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_clear();
+                }
+            }
+            midi_log("MIDI session ended, will reconnect");
+        }
+    });
+}
+
 // ── Instrument / MIDI select helper ──────────────────────────────────────────
 
 fn android_select(
@@ -715,17 +982,19 @@ impl eframe::App for InsetApp {
 fn start_oboe_stream(
     state: Arc<Mutex<SamplerState>>,
 ) -> oboe::AudioStreamAsync<oboe::Output, SamplerCallback> {
-    use oboe::{AudioStreamBuilder, PerformanceMode, SharingMode};
+    use oboe::{AudioStream, AudioStreamBuilder, PerformanceMode, SharingMode};
 
     let callback = SamplerCallback { state };
-    AudioStreamBuilder::default()
+    let mut stream = AudioStreamBuilder::default()
         .set_performance_mode(PerformanceMode::LowLatency)
         .set_sharing_mode(SharingMode::Exclusive)
         .set_stereo()
         .set_format::<f32>()
         .set_callback(callback)
         .open_stream()
-        .expect("failed to open Oboe stream")
+        .expect("failed to open Oboe stream");
+    stream.start().expect("failed to start Oboe stream");
+    stream
 }
 
 #[cfg(target_os = "android")]
