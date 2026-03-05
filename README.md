@@ -1,6 +1,6 @@
 # pianeer
 
-A low-latency piano sampler for keyboard instruments. Plays SFZ, Grand Orgue ODF, Kontakt 2, and GIG instruments in response to MIDI input. Runs on Linux, macOS, and Android.
+A low-latency piano sampler for keyboard instruments. Plays SFZ, Grand Orgue ODF, Kontakt 2, and GIG instruments in response to MIDI input. Runs on Linux, macOS, Windows, and Android.
 
 ## Download
 
@@ -11,11 +11,12 @@ Pre-built binaries are attached to each [GitHub Release](https://github.com/fora
 | `pianeer-macos-universal` | macOS — Intel and Apple Silicon (universal binary) |
 | `pianeer-linux-amd64` | Linux x86_64 |
 | `pianeer-linux-arm64` | Linux arm64 (Raspberry Pi OS 64-bit) |
+| `pianeer-windows-amd64.exe` | Windows x86_64 |
 | `pianeer-android.apk` | Android arm64 |
 
 ## Features
 
-- Real-time stereo audio via JACK/PipeWire (Linux), CoreAudio (macOS), or Oboe/AAudio (Android)
+- Real-time stereo audio via JACK/PipeWire (Linux), CoreAudio (macOS), WASAPI (Windows), or Oboe/AAudio (Android)
 - SFZ v2/ARIA format with full `<global>` → `<master>` → `<group>` → `<region>` inheritance
 - Grand Orgue ODF format (`.organ` files)
 - Kontakt 2 format (`.nki` / `.nkm` files)
@@ -45,6 +46,11 @@ Pre-built binaries are attached to each [GitHub Release](https://github.com/fora
 - macOS 11 or later (CoreAudio, no external audio daemon needed)
 - A MIDI keyboard connected via USB or Core MIDI
 - Rust toolchain + Xcode Command Line Tools for building
+
+### Windows
+- Windows 10 or later (WASAPI, no external audio daemon needed)
+- A MIDI keyboard connected via USB
+- Rust toolchain (MSVC) for building
 
 ### Android
 - Android 10+ (API 30+) — requires MANAGE_EXTERNAL_STORAGE permission
@@ -82,7 +88,12 @@ pw-jack ./target/release/pianeer
 ./target/release/pianeer
 ```
 
-**Native egui window** (Linux or macOS):
+**Windows** — run directly:
+```
+target\release\pianeer.exe
+```
+
+**Native egui window** (Linux, macOS, or Windows):
 ```bash
 pw-jack ./target/release/pianeer  # Linux, after building with --features native-ui
 ```
@@ -167,7 +178,7 @@ Pianeer is a Cargo workspace:
 | Crate | Role |
 |-------|------|
 | `core` (`pianeer-core`) | Sampler engine, all parsers, MIDI, types, web server — no platform I/O |
-| `desktop` (`pianeer`) | JACK (Linux) / CoreAudio (macOS) binary: terminal UI and optional native egui window |
+| `desktop` (`pianeer`) | JACK (Linux) / CoreAudio (macOS) / WASAPI (Windows) binary: terminal UI and optional native egui window |
 | `egui-app` (`pianeer-egui`) | Shared eframe `App` used by desktop (native-ui) and Android |
 | `web-wasm` (`pianeer-wasm`) | WASM build of the egui UI, served by the embedded web server |
 | `android` (`pianeer-android`) | Android NDK cdylib: Oboe audio + egui via android-activity |
@@ -201,8 +212,8 @@ Pianeer is a Cargo workspace:
 | `desktop/src/terminal.rs` | Raw-mode terminal loop (`run_terminal`) |
 | `desktop/src/gui.rs` | Native egui window path (`run_native_ui`, `--features native-ui`) |
 | `desktop/src/ui.rs` | Terminal rendering: `print_menu`, VU meter, seekbar, QR modal |
-| `desktop/src/audio.rs` | Platform audio dispatch: JACK/PipeWire (Linux), CoreAudio (macOS) |
-| `desktop/src/midi.rs` | MIDI input: midir/ALSA (Linux), midir/CoreMIDI (macOS) |
+| `desktop/src/audio.rs` | Platform audio dispatch: JACK/PipeWire (Linux), CoreAudio (macOS), WASAPI (Windows) |
+| `desktop/src/midi.rs` | MIDI input: midir/ALSA (Linux), midir/CoreMIDI (macOS), midir/WinMM (Windows) |
 
 ### egui-app modules
 
