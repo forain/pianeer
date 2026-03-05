@@ -1,16 +1,11 @@
 use std::io::Write;
 use std::time::Duration;
 
-#[cfg(not(target_os = "haiku"))]
 use crossterm::terminal;
-
 use pianeer_core::types::{MenuItem, PlaybackInfo, ProcStats, Settings};
 
 fn term_size() -> (u16, u16) {
-    #[cfg(not(target_os = "haiku"))]
-    return terminal::size().unwrap_or((80, 24));
-    #[cfg(target_os = "haiku")]
-    return crate::haiku_term::terminal_size();
+    terminal::size().unwrap_or((80, 24))
 }
 
 // ── VU bar ────────────────────────────────────────────────────────────────────

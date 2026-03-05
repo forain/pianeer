@@ -7,23 +7,15 @@ use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
-#[cfg(not(target_os = "haiku"))]
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-#[cfg(not(target_os = "haiku"))]
 use crossterm::terminal;
 
 fn raw_on() {
-    #[cfg(not(target_os = "haiku"))]
     terminal::enable_raw_mode().expect("Failed to enable raw mode");
-    #[cfg(target_os = "haiku")]
-    crate::haiku_term::enable_raw_mode();
 }
 
 fn raw_off() {
-    #[cfg(not(target_os = "haiku"))]
-    { terminal::disable_raw_mode().ok(); }
-    #[cfg(target_os = "haiku")]
-    crate::haiku_term::disable_raw_mode();
+    terminal::disable_raw_mode().ok();
 }
 
 use pianeer_core::loader::load_instrument_data;
@@ -73,7 +65,6 @@ pub fn run_terminal(
     );
 
     // Spawn input thread.
-    #[cfg(not(target_os = "haiku"))]
     {
         let quit_input    = Arc::clone(&quit);
         let reload_input  = Arc::clone(&reload);
@@ -153,13 +144,6 @@ pub fn run_terminal(
             }
         });
     }
-    #[cfg(target_os = "haiku")]
-    crate::haiku_term::spawn_input_thread(
-        action_tx.clone(),
-        Arc::clone(&quit),
-        Arc::clone(&reload),
-        Arc::clone(&show_qr),
-    );
 
     // Main loop: handle quit, reload, instrument switches, and MIDI file playback.
     let mut current = 0usize;

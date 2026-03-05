@@ -1,6 +1,6 @@
 # pianeer
 
-A low-latency piano sampler for keyboard instruments. Plays SFZ, Grand Orgue ODF, Kontakt 2, and GIG instruments in response to MIDI input. Runs on Linux, macOS, Haiku, and Android.
+A low-latency piano sampler for keyboard instruments. Plays SFZ, Grand Orgue ODF, Kontakt 2, and GIG instruments in response to MIDI input. Runs on Linux, macOS, and Android.
 
 ## Download
 
@@ -12,11 +12,10 @@ Pre-built binaries are attached to each [GitHub Release](https://github.com/fora
 | `pianeer-linux-amd64` | Linux x86_64 |
 | `pianeer-linux-arm64` | Linux arm64 (Raspberry Pi OS 64-bit) |
 | `pianeer-android.apk` | Android arm64 |
-| `pianeer-haiku-amd64` | Haiku x86_64 |
 
 ## Features
 
-- Real-time stereo audio via JACK/PipeWire (Linux), CoreAudio (macOS), BSoundPlayer (Haiku), or Oboe/AAudio (Android)
+- Real-time stereo audio via JACK/PipeWire (Linux), CoreAudio (macOS), or Oboe/AAudio (Android)
 - SFZ v2/ARIA format with full `<global>` → `<master>` → `<group>` → `<region>` inheritance
 - Grand Orgue ODF format (`.organ` files)
 - Kontakt 2 format (`.nki` / `.nkm` files)
@@ -47,12 +46,6 @@ Pre-built binaries are attached to each [GitHub Release](https://github.com/fora
 - A MIDI keyboard connected via USB or Core MIDI
 - Rust toolchain + Xcode Command Line Tools for building
 
-### Haiku
-- Haiku R1/beta5 or later (BSoundPlayer for audio, BMidiLocalConsumer for MIDI)
-- A USB MIDI keyboard connected via Haiku's MIDI server
-- Rust **nightly** toolchain (`pkgman install rust`) + GCC (for C++ shim compilation)
-- `x86_64-unknown-haiku` is a Tier 3 target — `std` must be compiled from source (`-Z build-std`)
-
 ### Android
 - Android 10+ (API 30+) — requires MANAGE_EXTERNAL_STORAGE permission
 - Place instruments under `/sdcard/Pianeer/samples/` and MIDI files under `/sdcard/Pianeer/midi/`
@@ -69,9 +62,6 @@ cargo build --release -p pianeer --features native-ui
 
 # WASM web UI (trunk required)
 cd web-wasm && trunk build --release
-
-# Haiku (native, in Haiku Terminal — nightly required, x86_64-unknown-haiku is Tier 3)
-cargo +nightly build --release -p pianeer -Z build-std=std,panic_abort --target x86_64-unknown-haiku
 
 # Android APK (NDK r29 required)
 cargo apk build --release -p pianeer-android
@@ -218,8 +208,6 @@ Pianeer is a Cargo workspace:
 | `desktop/src/ui.rs` | Terminal rendering: `print_menu`, VU meter, seekbar, QR modal |
 | `desktop/src/audio.rs` | Platform audio dispatch: JACK/PipeWire (Linux), CoreAudio (macOS), BSoundPlayer (Haiku) |
 | `desktop/src/midi.rs` | MIDI input: midir/ALSA (Linux), midir/CoreMIDI (macOS), BMidiLocalConsumer (Haiku) |
-| `desktop/src/haiku_audio.cpp` | C shim wrapping BSoundPlayer for Rust FFI |
-| `desktop/src/haiku_midi.cpp` | C++ shim wrapping BMidiLocalConsumer / BMidiRoster for Rust FFI |
 | `desktop/build.rs` | Compiles Haiku C++ shims via the `cc` crate when targeting Haiku |
 
 ### egui-app modules
