@@ -82,11 +82,6 @@ pw-jack ./target/release/pianeer
 ./target/release/pianeer
 ```
 
-**Haiku** — run directly:
-```bash
-./target/release/pianeer
-```
-
 **Native egui window** (Linux or macOS):
 ```bash
 pw-jack ./target/release/pianeer  # Linux, after building with --features native-ui
@@ -172,7 +167,7 @@ Pianeer is a Cargo workspace:
 | Crate | Role |
 |-------|------|
 | `core` (`pianeer-core`) | Sampler engine, all parsers, MIDI, types, web server — no platform I/O |
-| `desktop` (`pianeer`) | JACK (Linux) / CoreAudio (macOS) / BSoundPlayer (Haiku) binary: terminal UI and optional native egui window |
+| `desktop` (`pianeer`) | JACK (Linux) / CoreAudio (macOS) binary: terminal UI and optional native egui window |
 | `egui-app` (`pianeer-egui`) | Shared eframe `App` used by desktop (native-ui) and Android |
 | `web-wasm` (`pianeer-wasm`) | WASM build of the egui UI, served by the embedded web server |
 | `android` (`pianeer-android`) | Android NDK cdylib: Oboe audio + egui via android-activity |
@@ -194,7 +189,7 @@ Pianeer is a Cargo workspace:
 | `core/src/midi_recorder.rs` | MIDI recording to SMF Type-0 `.mid` |
 | `core/src/types.rs` | `MenuItem`, `MenuAction`, `Settings`, `PlaybackState`, `ProcStats` |
 | `core/src/snapshot.rs` | `WebSnapshot`, `ClientCmd`, `build_snapshot()` |
-| `core/src/sys_stats.rs` | CPU and memory stats (Linux `/proc`, macOS/Haiku `getrusage`) |
+| `core/src/sys_stats.rs` | CPU and memory stats (Linux `/proc`, macOS `getrusage`) |
 | `core/src/web.rs` | Axum HTTP + WebTransport server, serves embedded WASM UI |
 | `core/src/audio_stream.rs` | Lock-free ring buffer → FLAC encoder for audio streaming |
 
@@ -206,9 +201,8 @@ Pianeer is a Cargo workspace:
 | `desktop/src/terminal.rs` | Raw-mode terminal loop (`run_terminal`) |
 | `desktop/src/gui.rs` | Native egui window path (`run_native_ui`, `--features native-ui`) |
 | `desktop/src/ui.rs` | Terminal rendering: `print_menu`, VU meter, seekbar, QR modal |
-| `desktop/src/audio.rs` | Platform audio dispatch: JACK/PipeWire (Linux), CoreAudio (macOS), BSoundPlayer (Haiku) |
-| `desktop/src/midi.rs` | MIDI input: midir/ALSA (Linux), midir/CoreMIDI (macOS), BMidiLocalConsumer (Haiku) |
-| `desktop/build.rs` | Compiles Haiku C++ shims via the `cc` crate when targeting Haiku |
+| `desktop/src/audio.rs` | Platform audio dispatch: JACK/PipeWire (Linux), CoreAudio (macOS) |
+| `desktop/src/midi.rs` | MIDI input: midir/ALSA (Linux), midir/CoreMIDI (macOS) |
 
 ### egui-app modules
 
