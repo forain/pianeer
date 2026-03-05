@@ -130,9 +130,9 @@ mod jack_impl {
     }
 }
 
-// ── macOS / CoreAudio via cpal ────────────────────────────────────────────────
+// ── macOS / Windows via cpal ──────────────────────────────────────────────────
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod cpal_impl {
     use std::sync::{Arc, Mutex};
 
@@ -156,15 +156,19 @@ mod cpal_impl {
 
         let sample_rate = supported.sample_rate().0;
         let channels = supported.channels() as usize;
+        #[cfg(target_os = "macos")]
+        let backend_name = "CoreAudio";
+        #[cfg(target_os = "windows")]
+        let backend_name = "WASAPI";
         println!(
-            "CoreAudio: device={:?}, sample_rate={} Hz, channels={}",
-            device.name().as_deref().unwrap_or("unknown"), sample_rate, channels
+            "{}: device={:?}, sample_rate={} Hz, channels={}",
+            backend_name, device.name().as_deref().unwrap_or("unknown"), sample_rate, channels
         );
 
         if let Some(probed) = probed_rate {
             if probed != sample_rate {
                 eprintln!(
-                    "Warning: CoreAudio sample rate ({} Hz) differs from sample file rate ({} Hz); \
+                    "Warning: audio device sample rate ({} Hz) differs from sample file rate ({} Hz); \
                      pitch and timing may be incorrect.",
                     sample_rate, probed
                 );
@@ -199,95 +203,32 @@ mod cpal_impl {
                     // Any remaining channels (>2) are left as zero.
                 }
             },
-            |err| eprintln!("CoreAudio stream error: {}", err),
+            |err| eprintln!("Audio stream error: {}", err),
             None,
-        ).map_err(|e| format!("Failed to build CoreAudio output stream: {}", e))?;
+        ).map_err(|e| format!("Failed to build audio output stream: {}", e))?;
 
-        stream.play().map_err(|e| format!("Failed to start CoreAudio stream: {}", e))?;
-        println!("CoreAudio stream started.");
+        stream.play().map_err(|e| format!("Failed to start audio stream: {}", e))?;
+        println!("Audio stream started.");
         Ok(CpalActive { _stream: stream })
-    }
-}
-
-// ── Haiku / BSoundPlayer ──────────────────────────────────────────────────────
-
-#[cfg(target_os = "haiku")]
-mod haiku_impl {
-    use std::sync::{Arc, Mutex};
-
-    use pianeer_core::sampler::SamplerState;
-
-    extern "C" {
-        fn haiku_player_create(
-            fill_fn: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, usize),
-            cookie: *mut std::ffi::c_void,
-            desired_rate: u32,
-            out_rate: *mut u32,
-        ) -> *mut std::ffi::c_void;
-        fn haiku_player_start(handle: *mut std::ffi::c_void);
-        fn haiku_player_stop(handle: *mut std::ffi::c_void);
-        fn haiku_player_destroy(handle: *mut std::ffi::c_void);
-    }
-
-    struct CbState { sampler: Arc<Mutex<SamplerState>> }
-
-    unsafe extern "C" fn fill_cb(cookie: *mut std::ffi::c_void, buf: *mut std::ffi::c_void, size: usize) {
-        let state = &*(cookie as *const CbState);
-        let frames = size / (2 * std::mem::size_of::<f32>());
-        let out = std::slice::from_raw_parts_mut(buf as *mut f32, frames * 2);
-        let mut l = vec![0f32; frames];
-        let mut r = vec![0f32; frames];
-        if let Ok(ref mut s) = state.sampler.try_lock() { s.process(&mut l, &mut r); }
-        for i in 0..frames { out[i * 2] = l[i]; out[i * 2 + 1] = r[i]; }
-    }
-
-    pub struct HaikuProbe { pub sample_rate: u32 }
-
-    pub fn probe(probed_rate: Option<u32>) -> Result<HaikuProbe, String> {
-        Ok(HaikuProbe { sample_rate: probed_rate.unwrap_or(44100) })
-    }
-
-    pub struct HaikuActive { player: *mut std::ffi::c_void, _state: Box<CbState> }
-    unsafe impl Send for HaikuActive {}
-
-    pub fn start(probe: HaikuProbe, state: Arc<Mutex<SamplerState>>) -> Result<HaikuActive, String> {
-        let cb = Box::new(CbState { sampler: state });
-        let cookie = &*cb as *const CbState as *mut std::ffi::c_void;
-        let mut actual = probe.sample_rate;
-        let player = unsafe { haiku_player_create(fill_cb, cookie, probe.sample_rate, &mut actual) };
-        if player.is_null() { return Err("BSoundPlayer creation failed".to_string()); }
-        unsafe { haiku_player_start(player); }
-        println!("Haiku BSoundPlayer started at {} Hz", actual);
-        Ok(HaikuActive { player, _state: cb })
-    }
-
-    impl Drop for HaikuActive {
-        fn drop(&mut self) {
-            unsafe { haiku_player_stop(self.player); haiku_player_destroy(self.player); }
-        }
     }
 }
 
 // ── Unsupported platforms ─────────────────────────────────────────────────────
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "haiku")))]
-compile_error!("Unsupported platform: Linux (JACK), macOS (CoreAudio), and Haiku (BSoundPlayer) are supported.");
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!("Unsupported platform: Linux (JACK) and macOS/Windows (cpal) are supported.");
 
 // ── Platform type aliases ─────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
 type ProbeInner = jack_impl::JackProbe;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 type ProbeInner = cpal_impl::CpalProbe;
-#[cfg(target_os = "haiku")]
-type ProbeInner = haiku_impl::HaikuProbe;
 
 #[cfg(target_os = "linux")]
 type ActiveInner = jack_impl::JackActive;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 type ActiveInner = cpal_impl::CpalActive;
-#[cfg(target_os = "haiku")]
-type ActiveInner = haiku_impl::HaikuActive;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -305,16 +246,14 @@ pub struct ActiveAudio {
 }
 
 /// Open the platform audio device and negotiate the sample rate.
-/// On Linux this opens a JACK client; on macOS it queries CoreAudio.
-/// Pass `probed_rate` (from the sample files) so a mismatch warning can be
-/// printed early, before `SamplerState` is constructed.
+/// On Linux this opens a JACK client; on macOS/Windows it queries the default
+/// output device via cpal.  Pass `probed_rate` (from the sample files) so a
+/// mismatch warning can be printed early, before `SamplerState` is constructed.
 pub fn probe_audio(probed_rate: Option<u32>) -> Result<AudioProbe, String> {
     #[cfg(target_os = "linux")]
     let inner = jack_impl::probe(probed_rate)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let inner = cpal_impl::probe(probed_rate)?;
-    #[cfg(target_os = "haiku")]
-    let inner = haiku_impl::probe(probed_rate)?;
 
     let sample_rate = inner.sample_rate;
     Ok(AudioProbe { sample_rate, inner })
@@ -329,10 +268,8 @@ pub fn start_audio(
 ) -> Result<ActiveAudio, String> {
     #[cfg(target_os = "linux")]
     let inner = jack_impl::start(probe.inner, state)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let inner = cpal_impl::start(probe.inner, state)?;
-    #[cfg(target_os = "haiku")]
-    let inner = haiku_impl::start(probe.inner, state)?;
 
     Ok(ActiveAudio { _inner: inner })
 }
