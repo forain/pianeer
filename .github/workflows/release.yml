@@ -114,6 +114,31 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
+  # ── Windows ──────────────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    needs: [build-wasm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm-dist
+          path: web-wasm/dist/
+
+      - name: Build
+        run: cargo build --release -p pianeer --target x86_64-pc-windows-msvc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pianeer-windows-amd64
+          path: target/x86_64-pc-windows-msvc/release/pianeer.exe
+
   # ── Android ─────────────────────────────────────────────────────────────────
   build-android:
     name: Android arm64 APK
@@ -176,7 +201,7 @@ jobs:
   # Only runs on version tags; downloads all artifacts and attaches them.
   release:
     name: Publish GitHub release
-    needs: [build-macos, build-linux, build-android]
+    needs: [build-macos, build-linux, build-windows, build-android]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
