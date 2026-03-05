@@ -7,8 +7,24 @@ use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
+#[cfg(not(target_os = "haiku"))]
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+#[cfg(not(target_os = "haiku"))]
 use crossterm::terminal;
+
+fn raw_on() {
+    #[cfg(not(target_os = "haiku"))]
+    terminal::enable_raw_mode().expect("Failed to enable raw mode");
+    #[cfg(target_os = "haiku")]
+    crate::haiku_term::enable_raw_mode();
+}
+
+fn raw_off() {
+    #[cfg(not(target_os = "haiku"))]
+    { terminal::disable_raw_mode().ok(); }
+    #[cfg(target_os = "haiku")]
+    crate::haiku_term::disable_raw_mode();
+}
 
 use pianeer_core::loader::load_instrument_data;
 use pianeer_core::sampler::{MidiEvent, SamplerState};
@@ -36,7 +52,7 @@ pub fn run_terminal(
     reload:         Arc<AtomicBool>,
     show_qr:        Arc<AtomicBool>,
 ) {
-    terminal::enable_raw_mode().expect("Failed to enable raw mode");
+    raw_on();
 
     let mut settings = Settings::default();
     let mut sustain_prev = false;
@@ -56,86 +72,94 @@ pub fn run_terminal(
         false, None, None,
     );
 
-    // Spawn input thread (reads crossterm key events).
-    let quit_input   = Arc::clone(&quit);
-    let reload_input = Arc::clone(&reload);
-    let show_qr_input = Arc::clone(&show_qr);
-    thread::spawn(move || {
-        loop {
-            if quit_input.load(Ordering::Relaxed) {
-                break;
-            }
-            match event::poll(Duration::from_millis(50)) {
-                Ok(true) => {
-                    if let Ok(Event::Key(key)) = event::read() {
-                        let is_quit = matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
-                            || (matches!(key.code, KeyCode::Char('c'))
-                                && key.modifiers.contains(KeyModifiers::CONTROL));
-                        if is_quit {
-                            quit_input.store(true, Ordering::SeqCst);
-                            break;
-                        }
-                        if show_qr_input.load(Ordering::Relaxed) {
-                            let _ = action_tx.try_send(MenuAction::ShowQr);
-                            continue;
-                        }
-                        match key.code {
-                            KeyCode::Char('r') | KeyCode::Char('R') => {
-                                reload_input.store(true, Ordering::SeqCst);
+    // Spawn input thread.
+    #[cfg(not(target_os = "haiku"))]
+    {
+        let quit_input    = Arc::clone(&quit);
+        let reload_input  = Arc::clone(&reload);
+        let show_qr_input = Arc::clone(&show_qr);
+        thread::spawn(move || {
+            loop {
+                if quit_input.load(Ordering::Relaxed) { break; }
+                match event::poll(Duration::from_millis(50)) {
+                    Ok(true) => {
+                        if let Ok(Event::Key(key)) = event::read() {
+                            let is_quit = matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+                                || (matches!(key.code, KeyCode::Char('c'))
+                                    && key.modifiers.contains(KeyModifiers::CONTROL));
+                            if is_quit {
+                                quit_input.store(true, Ordering::SeqCst);
+                                break;
                             }
-                            KeyCode::Up    => { let _ = action_tx.try_send(MenuAction::CursorUp); }
-                            KeyCode::Down  => { let _ = action_tx.try_send(MenuAction::CursorDown); }
-                            KeyCode::Left  => { let _ = action_tx.try_send(MenuAction::CycleVariant(-1)); }
-                            KeyCode::Right => { let _ = action_tx.try_send(MenuAction::CycleVariant(1)); }
-                            KeyCode::Enter => { let _ = action_tx.try_send(MenuAction::Select); }
-                            KeyCode::Char('v') | KeyCode::Char('V') => {
-                                let _ = action_tx.try_send(MenuAction::CycleVeltrack);
-                            }
-                            KeyCode::Char('t') | KeyCode::Char('T') => {
-                                let _ = action_tx.try_send(MenuAction::CycleTune);
-                            }
-                            KeyCode::Char('e') | KeyCode::Char('E') => {
-                                let _ = action_tx.try_send(MenuAction::ToggleRelease);
-                            }
-                            KeyCode::Char('+') | KeyCode::Char('=') => {
-                                let _ = action_tx.try_send(MenuAction::VolumeChange(1));
-                            }
-                            KeyCode::Char('-') => {
-                                let _ = action_tx.try_send(MenuAction::VolumeChange(-1));
-                            }
-                            KeyCode::Char('[') => {
-                                let _ = action_tx.try_send(MenuAction::TransposeChange(-1));
-                            }
-                            KeyCode::Char(']') => {
-                                let _ = action_tx.try_send(MenuAction::TransposeChange(1));
-                            }
-                            KeyCode::Char('h') | KeyCode::Char('H') => {
-                                let _ = action_tx.try_send(MenuAction::ToggleResonance);
-                            }
-                            KeyCode::Char('w') | KeyCode::Char('W') => {
-                                let _ = action_tx.try_send(MenuAction::ToggleRecord);
-                            }
-                            KeyCode::Char(' ') => {
-                                let _ = action_tx.try_send(MenuAction::PauseResume);
-                            }
-                            KeyCode::Char(',') => {
-                                let _ = action_tx.try_send(MenuAction::SeekRelative(-10));
-                            }
-                            KeyCode::Char('.') => {
-                                let _ = action_tx.try_send(MenuAction::SeekRelative(10));
-                            }
-                            KeyCode::Char('p') | KeyCode::Char('P') => {
+                            if show_qr_input.load(Ordering::Relaxed) {
                                 let _ = action_tx.try_send(MenuAction::ShowQr);
+                                continue;
                             }
-                            _ => {}
+                            match key.code {
+                                KeyCode::Char('r') | KeyCode::Char('R') => {
+                                    reload_input.store(true, Ordering::SeqCst);
+                                }
+                                KeyCode::Up    => { let _ = action_tx.try_send(MenuAction::CursorUp); }
+                                KeyCode::Down  => { let _ = action_tx.try_send(MenuAction::CursorDown); }
+                                KeyCode::Left  => { let _ = action_tx.try_send(MenuAction::CycleVariant(-1)); }
+                                KeyCode::Right => { let _ = action_tx.try_send(MenuAction::CycleVariant(1)); }
+                                KeyCode::Enter => { let _ = action_tx.try_send(MenuAction::Select); }
+                                KeyCode::Char('v') | KeyCode::Char('V') => {
+                                    let _ = action_tx.try_send(MenuAction::CycleVeltrack);
+                                }
+                                KeyCode::Char('t') | KeyCode::Char('T') => {
+                                    let _ = action_tx.try_send(MenuAction::CycleTune);
+                                }
+                                KeyCode::Char('e') | KeyCode::Char('E') => {
+                                    let _ = action_tx.try_send(MenuAction::ToggleRelease);
+                                }
+                                KeyCode::Char('+') | KeyCode::Char('=') => {
+                                    let _ = action_tx.try_send(MenuAction::VolumeChange(1));
+                                }
+                                KeyCode::Char('-') => {
+                                    let _ = action_tx.try_send(MenuAction::VolumeChange(-1));
+                                }
+                                KeyCode::Char('[') => {
+                                    let _ = action_tx.try_send(MenuAction::TransposeChange(-1));
+                                }
+                                KeyCode::Char(']') => {
+                                    let _ = action_tx.try_send(MenuAction::TransposeChange(1));
+                                }
+                                KeyCode::Char('h') | KeyCode::Char('H') => {
+                                    let _ = action_tx.try_send(MenuAction::ToggleResonance);
+                                }
+                                KeyCode::Char('w') | KeyCode::Char('W') => {
+                                    let _ = action_tx.try_send(MenuAction::ToggleRecord);
+                                }
+                                KeyCode::Char(' ') => {
+                                    let _ = action_tx.try_send(MenuAction::PauseResume);
+                                }
+                                KeyCode::Char(',') => {
+                                    let _ = action_tx.try_send(MenuAction::SeekRelative(-10));
+                                }
+                                KeyCode::Char('.') => {
+                                    let _ = action_tx.try_send(MenuAction::SeekRelative(10));
+                                }
+                                KeyCode::Char('p') | KeyCode::Char('P') => {
+                                    let _ = action_tx.try_send(MenuAction::ShowQr);
+                                }
+                                _ => {}
+                            }
                         }
                     }
+                    Ok(false) => {}
+                    Err(_) => break,
                 }
-                Ok(false) => {}
-                Err(_) => break,
             }
-        }
-    });
+        });
+    }
+    #[cfg(target_os = "haiku")]
+    crate::haiku_term::spawn_input_thread(
+        action_tx.clone(),
+        Arc::clone(&quit),
+        Arc::clone(&reload),
+        Arc::clone(&show_qr),
+    );
 
     // Main loop: handle quit, reload, instrument switches, and MIDI file playback.
     let mut current = 0usize;
@@ -150,7 +174,7 @@ pub fn run_terminal(
 
         if quit.load(Ordering::Relaxed) {
             stop_playback(&mut playback);
-            terminal::disable_raw_mode().ok();
+            raw_off();
             println!("\r\nExiting...");
             break;
         }
@@ -376,14 +400,14 @@ pub fn run_terminal(
                             let _ = std::fs::create_dir_all(save_dir);
                             match midi_recorder::save(buf, save_dir) {
                                 Ok(path) => {
-                                    terminal::disable_raw_mode().ok();
+                                    raw_off();
                                     println!("\r\nRecording saved: {}", path.display());
-                                    terminal::enable_raw_mode().ok();
+                                    raw_on();
                                 }
                                 Err(e) => {
-                                    terminal::disable_raw_mode().ok();
+                                    raw_off();
                                     eprintln!("\r\nFailed to save recording: {}", e);
-                                    terminal::enable_raw_mode().ok();
+                                    raw_on();
                                 }
                             }
                             reload.store(true, Ordering::SeqCst);
@@ -431,7 +455,7 @@ pub fn run_terminal(
                             if idx != current || inst.path() != &current_path =>
                         {
                             while action_rx.try_recv().is_ok() {}
-                            terminal::disable_raw_mode().ok();
+                            raw_off();
                             println!("\r\nLoading {}...", inst.name);
                             let new_path = inst.path().clone();
                             match load_instrument_data(inst) {
@@ -450,7 +474,7 @@ pub fn run_terminal(
                                 }
                                 Err(e) => eprintln!("Error loading instrument: {}", e),
                             }
-                            terminal::enable_raw_mode().ok();
+                            raw_on();
                             let pb_info = mk_pb_info(&playback);
                             let rec_elapsed = midi_recorder::elapsed(&record_handle);
                             print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
@@ -516,7 +540,7 @@ pub fn run_terminal(
                             if idx != current || inst.path() != &current_path =>
                         {
                             while action_rx.try_recv().is_ok() {}
-                            terminal::disable_raw_mode().ok();
+                            raw_off();
                             println!("\r\nLoading {}...", inst.name);
                             let new_path = inst.path().clone();
                             match load_instrument_data(inst) {
@@ -535,7 +559,7 @@ pub fn run_terminal(
                                 }
                                 Err(e) => eprintln!("Error loading instrument: {}", e),
                             }
-                            terminal::enable_raw_mode().ok();
+                            raw_on();
                             let pb_info = mk_pb_info(&playback);
                             let rec_elapsed = midi_recorder::elapsed(&record_handle);
                             print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
