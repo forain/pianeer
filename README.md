@@ -60,11 +60,11 @@ Pre-built binaries are attached to each [GitHub Release](https://github.com/fora
 ## Building
 
 ```bash
-# Desktop (terminal UI, default)
+# Desktop — default (eframe window + DRM/KMS + terminal fallback)
 cargo build --release -p pianeer
 
-# Desktop with native egui window
-cargo build --release -p pianeer --features native-ui
+# Force raw-mode terminal at runtime
+cargo run -p pianeer -- --text
 
 # WASM web UI (trunk required)
 cd web-wasm && trunk build --release
@@ -75,6 +75,23 @@ cargo apk build --release -p pianeer-android
 # WAV → FLAC batch converter
 cargo build --release -p wav2flac
 ```
+
+### Desktop feature flags
+
+The default build compiles all UI backends in; the right one is chosen at runtime.
+
+| Command | What you get |
+|---|---|
+| `cargo build -p pianeer` | **Default** — eframe window + DRM/KMS + terminal, auto-selected |
+| `cargo run -p pianeer -- --text` | Force raw-mode terminal (also `-t`) |
+| `cargo build -p pianeer --no-default-features` | Terminal only |
+| `cargo build -p pianeer --no-default-features --features native-ui` | eframe + terminal fallback, no DRM |
+| `cargo build -p pianeer --no-default-features --features kms` | DRM/KMS + terminal, no eframe |
+
+**Runtime auto-selection** (default build, no `--text`):
+1. `WAYLAND_DISPLAY` or `DISPLAY` set → eframe native window
+2. Neither set + DRM device found → DRM/KMS egui (Linux headless)
+3. Fallback → raw-mode terminal
 
 ## Running
 

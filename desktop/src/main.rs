@@ -4,6 +4,8 @@ mod ui;
 mod terminal;
 #[cfg(feature = "native-ui")]
 mod gui;
+#[cfg(all(feature = "kms", target_os = "linux"))]
+mod drm_ui;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -103,7 +105,7 @@ fn main() {
     let quit   = Arc::new(AtomicBool::new(false));
     let reload = Arc::new(AtomicBool::new(false));
     let (action_tx, action_rx) = bounded::<MenuAction>(8);
-    #[cfg(not(feature = "native-ui"))]
+    // show_qr is only used by the terminal path but always allocated.
     let show_qr = Arc::new(AtomicBool::new(false));
 
     let web_snapshot: Arc<Mutex<String>> = Arc::new(Mutex::new("{}".to_string()));
@@ -122,18 +124,63 @@ fn main() {
         );
     }
 
-    // 12. Run either the native GUI or the raw-mode terminal.
-    #[cfg(feature = "native-ui")]
-    gui::run_native_ui(
-        menu, state, midi_tx, record_handle, midi_dir,
-        samples_dir, web_snapshot, action_tx, action_rx,
-        auto_tune, quit, reload,
-    );
+    // 12. Choose UI mode.
+    //   --text  : always use the raw-mode terminal
+    //   default : native GUI (eframe) when a display server is running,
+    //             DRM/KMS egui when running on bare Linux with no display server,
+    //             terminal as final fallback.
 
-    #[cfg(not(feature = "native-ui"))]
+    let use_text = std::env::args().any(|a| a == "--text" || a == "-t");
+
+    if use_text {
+        terminal::run_terminal(
+            menu, state, midi_tx, record_handle, midi_dir,
+            samples_dir, web_snapshot, action_tx, action_rx,
+            auto_tune, quit, reload, show_qr,
+        );
+        return;
+    }
+
+    // Native eframe GUI — only when a display server is available.
+    #[cfg(feature = "native-ui")]
+    if has_display() {
+        gui::run_native_ui(
+            menu, state, midi_tx, record_handle, midi_dir,
+            samples_dir, web_snapshot, action_tx, action_rx,
+            auto_tune, quit, reload,
+        );
+        return;
+    }
+
+    // DRM/KMS — Linux only, when compiled with the `kms` feature and no display server.
+    #[cfg(all(feature = "kms", target_os = "linux"))]
+    if drm_ui::drm_available() {
+        drm_ui::run_drm_ui(
+            menu, state, midi_tx, record_handle, midi_dir,
+            samples_dir, web_snapshot, action_tx, action_rx,
+            auto_tune, quit, reload,
+        );
+        return;
+    }
+
+    // Final fallback: terminal.
     terminal::run_terminal(
         menu, state, midi_tx, record_handle, midi_dir,
         samples_dir, web_snapshot, action_tx, action_rx,
         auto_tune, quit, reload, show_qr,
     );
+}
+
+/// Returns true when a Wayland or X11 display server is reachable.
+/// On non-Linux platforms a display is always assumed available.
+fn has_display() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var_os("DISPLAY").is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
 }

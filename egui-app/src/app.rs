@@ -30,8 +30,10 @@ impl PianeerApp {
     }
 }
 
-impl eframe::App for PianeerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl PianeerApp {
+    /// Drive the UI for one frame. Called by eframe's `update` and also
+    /// directly by the KMS rendering loop (which has no `eframe::Frame`).
+    pub fn update_egui(&mut self, ctx: &egui::Context) {
         self.backend.poll();
         let snap = self.backend.snapshot().clone();
 
@@ -58,6 +60,12 @@ impl eframe::App for PianeerApp {
         if self.show_qr {
             render_qr_window(ctx, &self.server_url, &self.qr_data, &mut self.show_qr);
         }
+    }
+}
+
+impl eframe::App for PianeerApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_egui(ctx);
     }
 }
 
