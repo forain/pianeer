@@ -8,5 +8,6 @@ pub mod midi_recorder;
 pub mod types;
 pub mod snapshot;
 pub mod sys_stats;
+pub mod dispatch;
 #[cfg(feature = "web")] pub mod audio_stream;
 #[cfg(feature = "web")] pub mod web;

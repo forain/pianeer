@@ -70,6 +70,26 @@ pub fn playing_idx(pb: &Option<PlaybackState>) -> Option<usize> {
         .map(|p| p.menu_idx)
 }
 
+pub fn pause_resume(pb: &Option<PlaybackState>) {
+    if let Some(ref p) = pb {
+        if !p.done.load(Ordering::Relaxed) {
+            let was = p.paused.load(Ordering::Relaxed);
+            p.paused.store(!was, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn seek_relative(pb: &Option<PlaybackState>, secs: i64) {
+    if let Some(ref p) = pb {
+        if !p.done.load(Ordering::Relaxed) {
+            let cur = p.current_us.load(Ordering::Relaxed);
+            let new_us = (cur as i64 + secs * 1_000_000i64)
+                .clamp(0, p.total_us as i64) as u64;
+            p.seek_to.store(new_us, Ordering::Relaxed);
+        }
+    }
+}
+
 // ── PlaybackInfo ──────────────────────────────────────────────────────────────
 
 /// Plain-value snapshot of playback position (no Arc/JoinHandle — safe to clone).

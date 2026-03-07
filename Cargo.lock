@@ -2529,6 +2529,7 @@ dependencies = [
  "crossbeam-channel",
  "eframe",
  "egui",
+ "ewebsock",
  "jni",
  "log",
  "oboe",

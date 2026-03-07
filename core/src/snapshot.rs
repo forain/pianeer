@@ -23,6 +23,7 @@ pub struct WebSnapshot {
     pub recording:      bool,
     pub rec_elapsed_us: Option<u64>,
     pub playback:       Option<PlaybackInfo>,
+    pub loading:        Option<(usize, u8)>,  // (menu_idx, percent 0..=100)
 }
 
 impl Default for WebSnapshot {
@@ -35,6 +36,7 @@ impl Default for WebSnapshot {
             recording:      false,
             rec_elapsed_us: None,
             playback:       None,
+            loading:        None,
         }
     }
 }
@@ -76,6 +78,7 @@ pub fn build_snapshot(
     recording:      bool,
     rec_elapsed_us: Option<u64>,
     playback:       Option<&PlaybackInfo>,
+    loading:        Option<(usize, u8)>,
 ) -> WebSnapshot {
     let items = menu.iter().enumerate().map(|(i, m)| {
         let variant = if let MenuItem::Instrument(inst) = m {
@@ -101,5 +104,6 @@ pub fn build_snapshot(
         recording,
         rec_elapsed_us,
         playback: playback.cloned(),
+        loading,
     }
 }

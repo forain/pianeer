@@ -10,29 +10,36 @@
 //   cargo apk build --release -p pianeer-android
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+/// Global InMemoryDexClassLoader holding all compiled app Java classes.
+/// Initialized once at startup; used by any thread that needs to call app Java code.
+static APP_CLASS_LOADER: OnceLock<jni::objects::GlobalRef> = OnceLock::new();
+
 use crossbeam_channel::bounded;
-use pianeer_core::loader::load_instrument_data;
+use pianeer_core::dispatch::{apply_settings_action, rebuild_menu};
+use pianeer_core::loader::{LoadingJob, poll_loading_job, save_last_instrument_path, last_instrument_path};
 use pianeer_core::sampler::{MidiEvent, SamplerState};
 use pianeer_core::snapshot::build_snapshot;
-use pianeer_core::sys_stats::{read_cpu_ticks, read_mem_mb};
+use pianeer_core::sys_stats::StatsCollector;
 use pianeer_core::types::{
-    MenuAction, MenuItem, PlaybackState, ProcStats, Settings,
-    stop_playback, playing_idx,
+    MenuAction, MenuItem, PlaybackState, Settings,
+    stop_playback, playing_idx, pause_resume, seek_relative,
 };
 use pianeer_core::{instruments, midi_player, midi_recorder};
-use pianeer_egui::{LocalBackend, PianeerApp};
+use pianeer_egui::{LocalBackend, PianeerApp, RemoteAudioPlayer};
 #[cfg(target_os = "android")]
 use oboe::Stereo;
+use ringbuf::{HeapConsumer, HeapProducer};
 
 #[cfg(target_os = "android")]
 mod amidi;
 
 const SAMPLES_DIR: &str = "/sdcard/Pianeer/samples";
-const MIDI_DIR: &str = "/sdcard/Pianeer/midi";
+const MIDI_DIR:    &str = "/sdcard/Pianeer/midi";
+const STATE_FILE:  &str = "/sdcard/Pianeer/.last_instrument";
 
 
 // ── Menu discovery ────────────────────────────────────────────────────────────
@@ -100,6 +107,129 @@ fn is_storage_manager(app: &android_activity::AndroidApp) -> bool {
     }
     try_check(app).unwrap_or(false)
 }
+
+/// Load the app DEX (all compiled Java classes) into an InMemoryDexClassLoader
+/// and store it globally so any thread can call loadClass() on it.
+#[cfg(target_os = "android")]
+fn init_class_loader(app: &android_activity::AndroidApp) {
+    fn try_init(app: &android_activity::AndroidApp) -> Option<()> {
+        use jni::objects::{JObject, JValueGen};
+        use jni::JavaVM;
+        const DEX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/midi_opener.dex"));
+        unsafe {
+            let vm = JavaVM::from_raw(app.vm_as_ptr() as *mut _)
+                .map_err(|e| log::error!("init_class_loader vm: {e:?}")).ok()?;
+            // Use get_env() because android-activity already permanently attached this thread;
+            // calling attach_current_thread() would schedule an unwanted detach on drop.
+            let mut env = vm.get_env()
+                .or_else(|_| vm.attach_current_thread_permanently())
+                .map_err(|e| log::error!("init_class_loader attach: {e:?}")).ok()?;
+            let activity = JObject::from_raw(app.activity_as_ptr() as *mut _);
+
+            let mut dex_copy = DEX.to_vec();
+            let byte_buf = env.new_direct_byte_buffer(dex_copy.as_mut_ptr(), dex_copy.len())
+                .map_err(|e| log::error!("init_class_loader ByteBuffer: {e:?}")).ok()?;
+            let parent = env.call_method(
+                &activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[],
+            ).ok()?.l().ok()?;
+            let imdcl = env.find_class("dalvik/system/InMemoryDexClassLoader").ok()?;
+            let loader = env.new_object(
+                &imdcl,
+                "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
+                &[JValueGen::Object(&byte_buf), JValueGen::Object(&parent)],
+            ).map_err(|e| log::error!("init_class_loader new IMDCL: {e:?}")).ok()?;
+            drop(dex_copy);
+            let gref = env.new_global_ref(&loader)
+                .map_err(|e| log::error!("init_class_loader global_ref: {e:?}")).ok()?;
+            APP_CLASS_LOADER.set(gref).ok();
+            log::info!("init_class_loader: DEX loaded ({} bytes)", DEX.len());
+            Some(())
+        }
+    }
+    if try_init(app).is_none() {
+        log::error!("init_class_loader: failed");
+    }
+}
+
+/// Load a named class from the app DEX using the global class loader.
+#[cfg(target_os = "android")]
+fn load_app_class<'a>(
+    env: &mut jni::JNIEnv<'a>,
+    name: &str,
+) -> Option<jni::objects::JClass<'a>> {
+    use jni::objects::{JClass, JValueGen};
+    let loader = APP_CLASS_LOADER.get()?;
+    let cls_name = env.new_string(name).ok()?;
+    let cls_obj = env.call_method(
+        loader, "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[JValueGen::Object(&cls_name)],
+    ).ok()?.l().ok()?;
+    Some(unsafe { JClass::from_raw(cls_obj.into_raw()) })
+}
+
+/// Acquire a SCREEN_BRIGHT_WAKE_LOCK so the display stays on while the app runs.
+/// Uses PowerManager JNI — safe to call from any thread; no UI thread needed.
+#[cfg(target_os = "android")]
+fn keep_screen_on(app: &android_activity::AndroidApp) {
+    fn try_keep(app: &android_activity::AndroidApp) -> Option<()> {
+        use jni::objects::{JObject, JValueGen};
+        use jni::JavaVM;
+        unsafe {
+            let vm = JavaVM::from_raw(app.vm_as_ptr() as *mut _)
+                .map_err(|e| log::error!("keep_screen_on vm: {e:?}"))
+                .ok()?;
+            let mut env = vm
+                .attach_current_thread()
+                .map_err(|e| log::error!("keep_screen_on attach: {e:?}"))
+                .ok()?;
+            let activity = JObject::from_raw(app.activity_as_ptr() as *mut _);
+
+            let svc_str = env.new_string("power")
+                .map_err(|e| log::error!("new_string power: {e:?}"))
+                .ok()?;
+            let pm = env
+                .call_method(
+                    &activity,
+                    "getSystemService",
+                    "(Ljava/lang/String;)Ljava/lang/Object;",
+                    &[JValueGen::Object(&svc_str)],
+                )
+                .map_err(|e| log::error!("getSystemService: {e:?}"))
+                .ok()?
+                .l()
+                .map_err(|e| log::error!("pm l(): {e:?}"))
+                .ok()?;
+
+            // SCREEN_BRIGHT_WAKE_LOCK (0xa) | ON_AFTER_RELEASE (0x20000000)
+            let flags: i32 = 0x2000_000a;
+            let tag = env.new_string("Pianeer:WakeLock")
+                .map_err(|e| log::error!("new_string tag: {e:?}"))
+                .ok()?;
+            let wl = env
+                .call_method(
+                    &pm,
+                    "newWakeLock",
+                    "(ILjava/lang/String;)Landroid/os/PowerManager$WakeLock;",
+                    &[JValueGen::Int(flags), JValueGen::Object(&tag)],
+                )
+                .map_err(|e| log::error!("newWakeLock: {e:?}"))
+                .ok()?
+                .l()
+                .map_err(|e| log::error!("wl l(): {e:?}"))
+                .ok()?;
+            env.call_method(&wl, "acquire", "()V", &[])
+                .map_err(|e| log::error!("wl.acquire: {e:?}"))
+                .ok()?;
+
+            Some(())
+        }
+    }
+    if try_keep(app).is_none() {
+        log::warn!("keep_screen_on: failed to acquire wake lock");
+    }
+}
+
 
 /// Open the system screen that lets the user grant MANAGE_EXTERNAL_STORAGE.
 #[cfg(target_os = "android")]
@@ -205,6 +335,11 @@ fn android_main(android_app: android_activity::AndroidApp) {
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
 
+    // Load app Java classes into a global class loader for use from any thread.
+    init_class_loader(&android_app);
+    // Keep screen on for the lifetime of the process.
+    keep_screen_on(&android_app);
+
     // ── MIDI + action channels ────────────────────────────────────────────────
     let (midi_tx, midi_rx) = bounded::<MidiEvent>(4096);
     let (action_tx, action_rx) = bounded::<MenuAction>(16);
@@ -266,42 +401,28 @@ fn android_main(android_app: android_activity::AndroidApp) {
             let mut playback: Option<PlaybackState> = None;
             let mut storage_ready   = false;
             let mut perm_requested  = false;
-            let mut prev_cpu_ticks  = read_cpu_ticks().unwrap_or(0);
-            let mut prev_cpu_instant = std::time::Instant::now();
-            let mut clip_until: Option<std::time::Instant> = None;
+            let mut stats_collector = StatsCollector::new();
+            let mut loading_job: Option<(usize, LoadingJob)> = None;
 
             loop {
                 // ── 1. Storage permission gate ────────────────────────────────
                 if !storage_ready {
                     if is_storage_manager(&app_bg) {
                         menu = discover_menu();
-                        // Load first instrument asynchronously.
-                        if let Some(MenuItem::Instrument(inst)) = menu.first() {
-                            let new_path    = inst.path().clone();
-                            let inst_clone  = inst.clone();
-                            let state2      = Arc::clone(&state);
-                            let at_bits2    = Arc::clone(&auto_tune_bits);
-                            let tune_semi   = settings.tune.semitones();
-                            thread::spawn(move || {
-                                match load_instrument_data(&inst_clone) {
-                                    Ok(loaded) => {
-                                        if let Ok(ref mut s) = state2.lock() {
-                                            s.swap_instrument(
-                                                loaded.regions, loaded.samples,
-                                                loaded.cc_defaults,
-                                                loaded.sw_lokey, loaded.sw_hikey,
-                                                loaded.sw_default,
-                                            );
-                                            let new_at = s.detect_a4_tune_correction();
-                                            s.master_tune_semitones = new_at + tune_semi;
-                                            at_bits2.store(new_at.to_bits(), Ordering::Relaxed);
-                                        }
-                                    }
-                                    Err(e) => log::error!("initial load: {e}"),
-                                }
-                            });
-                            current      = 0;
-                            current_path = new_path;
+                        // Restore last session's instrument, or fall back to first.
+                        let saved = last_instrument_path(std::path::Path::new(STATE_FILE));
+                        let initial = saved.as_ref()
+                            .and_then(|p| menu.iter().enumerate().find_map(|(i, m)| {
+                                if let MenuItem::Instrument(inst) = m {
+                                    if inst.path() == p.as_path() { Some((i, inst.clone())) } else { None }
+                                } else { None }
+                            }))
+                            .or_else(|| menu.iter().enumerate().find_map(|(i, m)| {
+                                if let MenuItem::Instrument(inst) = m { Some((i, inst.clone())) } else { None }
+                            }));
+                        if let Some((idx, inst)) = initial {
+                            cursor = idx;
+                            loading_job = Some((idx, LoadingJob::start(inst)));
                         }
                         storage_ready = true;
                     } else if !perm_requested {
@@ -311,6 +432,7 @@ fn android_main(android_app: android_activity::AndroidApp) {
                 }
 
                 // ── 2. Drain actions ──────────────────────────────────────────
+                let auto_tune = f32::from_bits(auto_tune_bits.load(Ordering::Relaxed));
                 while let Ok(action) = action_rx.try_recv() {
                     match action {
                         MenuAction::CursorUp => {
@@ -329,157 +451,84 @@ fn android_main(android_app: android_activity::AndroidApp) {
                                 inst.cycle_variant(dir);
                             }
                         }
-                        MenuAction::CycleVeltrack => {
-                            settings.veltrack = settings.veltrack.cycle();
-                            if let Ok(ref mut s) = state.lock() {
-                                s.veltrack_override = settings.veltrack.override_pct();
-                            }
-                        }
-                        MenuAction::CycleTune => {
-                            settings.tune = settings.tune.cycle();
-                            let auto_tune = f32::from_bits(auto_tune_bits.load(Ordering::Relaxed));
-                            if let Ok(ref mut s) = state.lock() {
-                                s.master_tune_semitones = auto_tune + settings.tune.semitones();
-                            }
-                        }
-                        MenuAction::ToggleRelease => {
-                            settings.release_enabled = !settings.release_enabled;
-                            if let Ok(ref mut s) = state.lock() {
-                                s.release_enabled = settings.release_enabled;
-                            }
-                        }
-                        MenuAction::VolumeChange(d) => {
-                            settings.volume_db =
-                                (settings.volume_db + d as f32 * 3.0).clamp(-12.0, 12.0);
-                            if let Ok(ref mut s) = state.lock() {
-                                s.master_volume = 10.0_f32.powf(settings.volume_db / 20.0);
-                            }
-                        }
-                        MenuAction::TransposeChange(d) => {
-                            settings.transpose =
-                                (settings.transpose + d as i32).clamp(-12, 12);
-                            if let Ok(ref mut s) = state.lock() {
-                                s.transpose = settings.transpose;
-                            }
-                        }
-                        MenuAction::ToggleResonance => {
-                            settings.resonance_enabled = !settings.resonance_enabled;
-                            if let Ok(ref mut s) = state.lock() {
-                                s.resonance_enabled = settings.resonance_enabled;
-                            }
-                        }
-                        MenuAction::PauseResume => {
-                            if let Some(ref pb) = playback {
-                                if !pb.done.load(Ordering::Relaxed) {
-                                    let was = pb.paused.load(Ordering::Relaxed);
-                                    pb.paused.store(!was, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                        MenuAction::SeekRelative(secs) => {
-                            if let Some(ref pb) = playback {
-                                if !pb.done.load(Ordering::Relaxed) {
-                                    let cur = pb.current_us.load(Ordering::Relaxed);
-                                    let new_us = (cur as i64 + secs * 1_000_000i64)
-                                        .clamp(0, pb.total_us as i64) as u64;
-                                    pb.seek_to.store(new_us, Ordering::Relaxed);
-                                }
-                            }
-                        }
+                        MenuAction::PauseResume => { pause_resume(&playback); }
+                        MenuAction::SeekRelative(secs) => { seek_relative(&playback, secs); }
                         MenuAction::ToggleRecord => {
                             if midi_recorder::is_recording(&record_handle) {
                                 if let Some(buf) = midi_recorder::stop(&record_handle) {
-                                    let dir = std::path::PathBuf::from(MIDI_DIR);
-                                    let _ = std::fs::create_dir_all(&dir);
-                                    match midi_recorder::save(buf, &dir) {
+                                    let dir = std::path::Path::new(MIDI_DIR);
+                                    let _ = std::fs::create_dir_all(dir);
+                                    match midi_recorder::save(buf, dir) {
                                         Ok(p)  => log::info!("recording saved: {}", p.display()),
                                         Err(e) => log::error!("save failed: {e}"),
                                     }
-                                    menu = discover_menu();
-                                    cursor  = cursor.min(menu.len().saturating_sub(1));
-                                    current = current.min(menu.len().saturating_sub(1));
+                                    (menu, current, cursor, current_path) = rebuild_menu(
+                                        std::path::Path::new(SAMPLES_DIR),
+                                        Some(std::path::Path::new(MIDI_DIR)),
+                                        &menu, current, cursor,
+                                    );
                                 }
                             } else {
                                 midi_recorder::start(&record_handle);
                             }
                         }
                         MenuAction::Select => {
-                            android_select(
-                                cursor, &mut menu, &mut current, &mut current_path,
-                                &auto_tune_bits, &settings, &state, &midi_tx_bg,
-                                &mut playback,
-                            );
+                            let idx = cursor;
+                            if idx < menu.len() {
+                                match &menu[idx] {
+                                    MenuItem::Instrument(inst)
+                                        if idx != current || inst.path() != current_path.as_path() =>
+                                    {
+                                        loading_job = Some((idx, LoadingJob::start(inst.clone())));
+                                    }
+                                    MenuItem::MidiFile { .. } => {
+                                        android_select(idx, &mut menu, &midi_tx_bg, &mut playback);
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
                         MenuAction::SelectAt(target) => {
                             cursor = target.min(menu.len().saturating_sub(1));
-                            android_select(
-                                cursor, &mut menu, &mut current, &mut current_path,
-                                &auto_tune_bits, &settings, &state, &midi_tx_bg,
-                                &mut playback,
-                            );
+                            let idx = cursor;
+                            if idx < menu.len() {
+                                match &menu[idx] {
+                                    MenuItem::Instrument(inst)
+                                        if idx != current || inst.path() != current_path.as_path() =>
+                                    {
+                                        loading_job = Some((idx, LoadingJob::start(inst.clone())));
+                                    }
+                                    MenuItem::MidiFile { .. } => {
+                                        android_select(idx, &mut menu, &midi_tx_bg, &mut playback);
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
                         MenuAction::Rescan => {
-                            let saved_path = match menu.get(current) {
-                                Some(MenuItem::Instrument(i)) => Some(i.path().clone()),
-                                _ => None,
-                            };
-                            menu = discover_menu();
-                            current = saved_path
-                                .and_then(|p| menu.iter().position(|m| {
-                                    matches!(m, MenuItem::Instrument(i) if i.path() == &p)
-                                }))
-                                .unwrap_or(0);
-                            cursor = cursor.min(menu.len().saturating_sub(1));
-                            current_path = menu.get(current)
-                                .and_then(|m| {
-                                    if let MenuItem::Instrument(i) = m {
-                                        Some(i.path().clone())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or_default();
+                            (menu, current, cursor, current_path) = rebuild_menu(
+                                std::path::Path::new(SAMPLES_DIR),
+                                Some(std::path::Path::new(MIDI_DIR)),
+                                &menu, current, cursor,
+                            );
                         }
                         MenuAction::ShowQr => {} // no-op on Android
+                        _ => { apply_settings_action(&action, &mut settings, auto_tune, &state); }
                     }
                 }
 
-                // ── 3. Poll sampler state ─────────────────────────────────────
-                let (sustain_now, voices_now, peak_l, peak_r, clip_now) = state
-                    .try_lock()
-                    .map(|mut s| {
-                        let clip = s.clip_l || s.clip_r;
-                        s.clip_l = false;
-                        s.clip_r = false;
-                        (s.sustain_pedal, s.active_voice_count(), s.peak_l, s.peak_r, clip)
-                    })
-                    .unwrap_or((false, 0, 0.0, 0.0, false));
-
-                // ── 4. CPU / memory stats ─────────────────────────────────────
-                let now = std::time::Instant::now();
-                if clip_now {
-                    clip_until = Some(now + Duration::from_secs(2));
+                // ── 2b. Poll in-progress instrument load ─────────────────────
+                if let Some((new_idx, new_path, new_at)) =
+                    poll_loading_job(&mut loading_job, &state, &settings, &menu)
+                {
+                    current = new_idx;
+                    save_last_instrument_path(std::path::Path::new(STATE_FILE), &new_path);
+                    current_path = new_path;
+                    auto_tune_bits.store(new_at.to_bits(), Ordering::Relaxed);
                 }
-                let clip_holding = clip_until.map(|t| now < t).unwrap_or(false);
 
-                let elapsed = now.duration_since(prev_cpu_instant).as_secs_f32().max(0.001);
-                let ticks_now = read_cpu_ticks().unwrap_or(prev_cpu_ticks);
-                let cpu_pct = (((ticks_now.saturating_sub(prev_cpu_ticks)) as f32 / 100.0)
-                    / elapsed
-                    * 100.0)
-                    .round()
-                    .clamp(0.0, 100.0) as u8;
-                prev_cpu_ticks = ticks_now;
-                prev_cpu_instant = now;
-
-                let stats = ProcStats {
-                    cpu_pct,
-                    mem_mb: read_mem_mb(),
-                    voices: voices_now,
-                    peak_l,
-                    peak_r,
-                    clip: clip_holding,
-                };
+                // ── 3+4. Stats ────────────────────────────────────────────────
+                let (stats, sustain_now) = stats_collector.tick(&state);
 
                 // ── 5. Playback bookkeeping ───────────────────────────────────
                 if playback.as_ref().map_or(false, |p| p.done.load(Ordering::Relaxed)) {
@@ -493,6 +542,7 @@ fn android_main(android_app: android_activity::AndroidApp) {
                 let rec_active   = midi_recorder::is_recording(&record_handle);
 
                 // ── 6. Build + publish snapshot ───────────────────────────────
+                let loading_info = loading_job.as_ref().map(|(idx, job)| (*idx, job.pct()));
                 let snap_obj = build_snapshot(
                     &menu, cursor, current,
                     playing_idx(&playback),
@@ -500,6 +550,7 @@ fn android_main(android_app: android_activity::AndroidApp) {
                     rec_active,
                     rec_elapsed.map(|d| d.as_micros() as u64),
                     pb_info.as_ref(),
+                    loading_info,
                 );
                 if let Ok(json) = serde_json::to_string(&snap_obj) {
                     if let Ok(mut s) = snap.lock() {
@@ -513,7 +564,8 @@ fn android_main(android_app: android_activity::AndroidApp) {
     }
 
     // ── Oboe audio stream ─────────────────────────────────────────────────────
-    let _audio = start_oboe_stream(Arc::clone(&state));
+    let (remote_prod, remote_cons) = ringbuf::HeapRb::<f32>::new(48000 * 2).split();
+    let _audio = start_oboe_stream(Arc::clone(&state), remote_cons);
 
     // ── eframe native window (android-native-activity) ────────────────────────
     let backend    = LocalBackend::new(snap_for_ui, action_tx);
@@ -524,8 +576,9 @@ fn android_main(android_app: android_activity::AndroidApp) {
         .and_then(|s| { s.connect("1.1.1.1:80").ok()?; s.local_addr().ok() })
         .map(|a| format!("http://{}:4000", a.ip()))
         .unwrap_or_else(|| "http://localhost:4000".to_string());
-    let inner      = PianeerApp::new(Box::new(backend), server_url);
-    let app        = InsetApp { inner, android_app: android_app.clone(), top_px: None };
+    let mut inner  = PianeerApp::new(Box::new(backend), server_url);
+    inner.set_remote_audio(Box::new(AndroidRemoteAudio::new(remote_prod)));
+    let app        = InsetApp { inner, android_app: android_app.clone(), top_px: None, connect_dialog_open: false };
 
     let mut native_options = eframe::NativeOptions::default();
     native_options.event_loop_builder = Some(Box::new(move |builder| {
@@ -620,9 +673,17 @@ fn spawn_midi_api_thread(
             thread::sleep(Duration::from_secs(2));
 
             // Try to open a MIDI device via AMidi.
-            let session = (|| -> Option<(*mut AMidiDevice, *mut AMidiOutputPort, jni::objects::GlobalRef)> {
+            // Returns (amidi_dev, amidi_port, dev_gref, opener_gref).
+            // opener_gref holds the MidiOpener Java object whose `.removed` field
+            // is set true by DeviceWatcher when the USB device is unplugged.
+            let session = (|| -> Option<(*mut AMidiDevice, *mut AMidiOutputPort, jni::objects::GlobalRef, jni::objects::GlobalRef)> {
                 let mut env = vm.attach_current_thread()
                     .map_err(|e| log::error!("midi: attach: {e:?}")).ok()?;
+                // Clear any exception left over from a previous failed iteration
+                // to prevent jni-rs from panicking on the next JNI call.
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_clear();
+                }
                 let activity = unsafe { JObject::from_raw(activity_ptr as *mut _) };
 
                 // Load MidiOpener via InMemoryDexClassLoader.
@@ -689,15 +750,27 @@ fn spawn_midi_api_thread(
                 let info_gref = info_gref?;
 
                 // Open device synchronously via MidiOpener.openSync().
-                let dev_obj = env.call_static_method(
+                // Returns a MidiOpener object (not MidiDevice directly).
+                let opener_obj = env.call_static_method(
                     &opener_cls, "openSync",
                     "(Landroid/media/midi/MidiManager;\
                       Landroid/media/midi/MidiDeviceInfo;)\
-                      Landroid/media/midi/MidiDevice;",
+                      Lcom/pianeer/app/MidiOpener;",
                     &[JValueGen::Object(&midi_mgr), JValueGen::Object(info_gref.as_obj())],
                 ).map_err(|e| log::error!("midi: openSync: {e:?}")).ok()?.l().ok()?;
-                if dev_obj.is_null() {
+                if opener_obj.is_null() {
                     log::error!("midi: openSync returned null");
+                    return None;
+                }
+                let opener_gref = env.new_global_ref(&opener_obj)
+                    .map_err(|e| log::error!("midi: global_ref opener: {e:?}")).ok()?;
+
+                // Get the MidiDevice from the opener's .device field.
+                let dev_obj = env.get_field(&opener_obj, "device", "Landroid/media/midi/MidiDevice;")
+                    .map_err(|e| log::error!("midi: opener.device: {e:?}")).ok()?
+                    .l().map_err(|e| log::error!("midi: opener.device l(): {e:?}")).ok()?;
+                if dev_obj.is_null() {
+                    log::error!("midi: openSync: device is null");
                     return None;
                 }
                 let dev_gref = env.new_global_ref(&dev_obj)
@@ -723,20 +796,40 @@ fn spawn_midi_api_thread(
                 }
 
                 log::info!("midi: connected via AMidi");
-                Some((amidi_dev, amidi_port, dev_gref))
+                Some((amidi_dev, amidi_port, dev_gref, opener_gref))
             })();
 
-            let (amidi_dev, port, dev_gref) = match session {
+            let (amidi_dev, port, dev_gref, opener_gref) = match session {
                 Some(s) => s,
                 None    => continue,
             };
 
             // Native polling loop — no JNI overhead in hot path.
+            // `handles_valid`: false when Android already freed the native AMidi handles
+            // (i.e. AMidiOutputPort_receive returned an error).  In that case we must
+            // NOT call AMidiOutputPort_close / AMidiDevice_release or we will crash.
+            let mut handles_valid = true;
             let mut opcode: i32 = 0;
             let mut midi_buf = [0u8; 128];
             let mut n_bytes: usize = 0;
             let mut timestamp: i64 = 0;
             loop {
+                // Check the Java DeviceWatcher flag BEFORE every receive call so we
+                // stop polling as soon as Android signals removal — before native
+                // handles are invalidated.  The JNI boolean read is ~1 µs; negligible
+                // vs the 5 ms idle sleep below.
+                let removed = vm.attach_current_thread().ok()
+                    .and_then(|mut env| {
+                        env.get_field(opener_gref.as_obj(), "removed", "Z")
+                            .ok()?.z().ok()
+                    })
+                    .unwrap_or(false);
+                if removed {
+                    log::info!("midi: device removed (DeviceCallback), closing");
+                    let _ = tx.send(MidiEvent::AllNotesOff);
+                    break;
+                }
+
                 let result = unsafe {
                     AMidiOutputPort_receive(
                         port, &mut opcode,
@@ -745,7 +838,11 @@ fn spawn_midi_api_thread(
                     )
                 };
                 if result < 0 {
+                    // Android already freed the native handles — do NOT call
+                    // AMidiOutputPort_close / AMidiDevice_release after this.
                     log::info!("midi: receive error {result}, reconnecting");
+                    handles_valid = false;
+                    let _ = tx.send(MidiEvent::AllNotesOff);
                     break;
                 }
                 if result == 0 || n_bytes == 0 {
@@ -764,16 +861,22 @@ fn spawn_midi_api_thread(
                 }
             }
 
-            // Clean up native handles, then close the Java device.
-            unsafe {
-                AMidiOutputPort_close(port);
-                AMidiDevice_release(amidi_dev);
-            }
-            if let Ok(mut env) = vm.attach_current_thread() {
-                let _ = env.call_method(dev_gref.as_obj(), "close", "()V", &[]);
-                if env.exception_check().unwrap_or(false) {
-                    let _ = env.exception_clear();
+            // Only release native handles when we broke cleanly (DeviceCallback path).
+            // If the receive returned an error, Android has already freed the handles
+            // and calling close/release would crash.
+            if handles_valid {
+                unsafe {
+                    AMidiOutputPort_close(port);
+                    AMidiDevice_release(amidi_dev);
                 }
+            }
+            // Always do the Java-side cleanup regardless.
+            if let Ok(mut env) = vm.attach_current_thread() {
+                if env.exception_check().unwrap_or(false) { let _ = env.exception_clear(); }
+                let _ = env.call_method(opener_gref.as_obj(), "cleanup", "()V", &[]);
+                if env.exception_check().unwrap_or(false) { let _ = env.exception_clear(); }
+                let _ = env.call_method(dev_gref.as_obj(), "close", "()V", &[]);
+                if env.exception_check().unwrap_or(false) { let _ = env.exception_clear(); }
             }
             log::info!("midi: session ended, will reconnect");
         }
@@ -783,48 +886,15 @@ fn spawn_midi_api_thread(
 // ── Instrument / MIDI select helper ──────────────────────────────────────────
 
 fn android_select(
-    idx:            usize,
-    menu:           &mut Vec<MenuItem>,
-    current:        &mut usize,
-    current_path:   &mut std::path::PathBuf,
-    auto_tune_bits: &Arc<AtomicU32>,
-    settings:       &Settings,
-    state:          &Arc<Mutex<SamplerState>>,
-    midi_tx:        &crossbeam_channel::Sender<MidiEvent>,
-    playback:       &mut Option<PlaybackState>,
+    idx:     usize,
+    menu:    &mut Vec<MenuItem>,
+    midi_tx: &crossbeam_channel::Sender<MidiEvent>,
+    playback: &mut Option<PlaybackState>,
 ) {
     if idx >= menu.len() {
         return;
     }
     match &menu[idx] {
-        MenuItem::Instrument(inst)
-            if idx != *current || inst.path() != current_path.as_path() =>
-        {
-            let new_path   = inst.path().clone();
-            let inst_clone = inst.clone();
-            let state2     = Arc::clone(state);
-            let at_bits2   = Arc::clone(auto_tune_bits);
-            let tune_semi  = settings.tune.semitones();
-            thread::spawn(move || {
-                match load_instrument_data(&inst_clone) {
-                    Ok(loaded) => {
-                        if let Ok(ref mut s) = state2.lock() {
-                            s.swap_instrument(
-                                loaded.regions, loaded.samples,
-                                loaded.cc_defaults,
-                                loaded.sw_lokey, loaded.sw_hikey, loaded.sw_default,
-                            );
-                            let new_at = s.detect_a4_tune_correction();
-                            s.master_tune_semitones = new_at + tune_semi;
-                            at_bits2.store(new_at.to_bits(), Ordering::Relaxed);
-                        }
-                    }
-                    Err(e) => log::error!("load instrument: {e}"),
-                }
-            });
-            *current      = idx;
-            *current_path = new_path;
-        }
         MenuItem::MidiFile { path, .. } => {
             let path           = path.clone();
             let already_playing = playback
@@ -933,10 +1003,63 @@ fn status_bar_height_px(app: &android_activity::AndroidApp) -> Option<f32> {
 
 #[cfg(target_os = "android")]
 struct InsetApp {
-    inner:       PianeerApp,
-    android_app: android_activity::AndroidApp,
+    inner:               PianeerApp,
+    android_app:         android_activity::AndroidApp,
     /// Cached pixel height of the status bar (None until first successful JNI call).
-    top_px:      Option<f32>,
+    top_px:              Option<f32>,
+    /// True while the connect dialog is open (prevents showing it again).
+    connect_dialog_open: bool,
+}
+
+/// Show a system AlertDialog with an EditText for text input.
+/// NativeActivity's SurfaceView has no IME connection, so showSoftInput always
+/// fails. A real EditText in a dialog is the only reliable solution.
+#[cfg(target_os = "android")]
+fn show_connect_dialog(app: &android_activity::AndroidApp, current: &str) {
+    fn try_show(app: &android_activity::AndroidApp, current: &str) -> Option<()> {
+        use jni::objects::{JObject, JValueGen};
+        use jni::JavaVM;
+        unsafe {
+            let vm = JavaVM::from_raw(app.vm_as_ptr() as *mut _).ok()?;
+            let mut env = vm.attach_current_thread().ok()?;
+            let activity = JObject::from_raw(app.activity_as_ptr() as *mut _);
+            let cls = load_app_class(&mut env, "com.pianeer.app.TextInputOverlay")?;
+            let cur = env.new_string(current).ok()?;
+            env.call_static_method(
+                &cls,
+                "showDialog",
+                "(Landroid/app/Activity;Ljava/lang/String;)V",
+                &[JValueGen::Object(&activity), JValueGen::Object(&cur)],
+            )
+            .ok()?;
+            Some(())
+        }
+    }
+    let _ = try_show(app, current);
+}
+
+/// Poll TextInputOverlay for a confirmed result. Returns Some(text) once.
+#[cfg(target_os = "android")]
+fn poll_connect_dialog(app: &android_activity::AndroidApp) -> Option<String> {
+    fn try_poll(app: &android_activity::AndroidApp) -> Option<Option<String>> {
+        use jni::JavaVM;
+        unsafe {
+            let vm = JavaVM::from_raw(app.vm_as_ptr() as *mut _).ok()?;
+            let mut env = vm.attach_current_thread().ok()?;
+            let cls = load_app_class(&mut env, "com.pianeer.app.TextInputOverlay")?;
+            let result = env
+                .call_static_method(&cls, "takePendingResult", "()Ljava/lang/String;", &[])
+                .ok()?
+                .l()
+                .ok()?;
+            if result.is_null() {
+                return Some(None);
+            }
+            let s: String = env.get_string(&result.into()).ok()?.into();
+            Some(Some(s))
+        }
+    }
+    try_poll(app).flatten()
 }
 
 #[cfg(target_os = "android")]
@@ -954,6 +1077,47 @@ impl eframe::App for InsetApp {
             }
         }
         self.inner.update(ctx, frame);
+
+        // Poll for a confirmed result from the connect dialog.
+        if let Some(text) = poll_connect_dialog(&self.android_app) {
+            self.inner.handle_connect_result(text);
+            self.connect_dialog_open = false;
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() { m.surrender_focus(id); }
+            });
+        }
+
+        // Also trigger dialog when egui TextEdit gets focus (belt-and-suspenders).
+        let wants_kbd = ctx.wants_keyboard_input();
+        if wants_kbd && !self.connect_dialog_open {
+            let current = self.inner.get_connect_input().to_string();
+            show_connect_dialog(&self.android_app, &current);
+            self.connect_dialog_open = true;
+        }
+        if !wants_kbd { self.connect_dialog_open = false; }
+
+        // Floating "Connect" button — always visible, bypasses egui focus entirely.
+        // The soft keyboard never works in NativeActivity without a real View.
+        let is_connected = self.inner.is_remote();
+        egui::Window::new("android_connect")
+            .title_bar(false)
+            .anchor(egui::Align2::LEFT_BOTTOM, [8.0, -72.0])
+            .resizable(false)
+            .show(ctx, |ui| {
+                let label = if is_connected { "🌐 ✓ Connect" } else { "🌐 Connect" };
+                let color = if is_connected {
+                    egui::Color32::from_rgb(80, 192, 80)
+                } else {
+                    egui::Color32::from_gray(200)
+                };
+                if ui.button(egui::RichText::new(label).color(color)).clicked()
+                    && !self.connect_dialog_open
+                {
+                    let current = self.inner.get_connect_input().to_string();
+                    show_connect_dialog(&self.android_app, &current);
+                    self.connect_dialog_open = true;
+                }
+            });
     }
 }
 
@@ -962,10 +1126,11 @@ impl eframe::App for InsetApp {
 #[cfg(target_os = "android")]
 fn start_oboe_stream(
     state: Arc<Mutex<SamplerState>>,
+    remote_cons: HeapConsumer<f32>,
 ) -> oboe::AudioStreamAsync<oboe::Output, SamplerCallback> {
     use oboe::{AudioStream, AudioStreamBuilder, PerformanceMode, SharingMode};
 
-    let callback = SamplerCallback { state };
+    let callback = SamplerCallback { state, remote_cons };
     let mut stream = AudioStreamBuilder::default()
         .set_performance_mode(PerformanceMode::LowLatency)
         .set_sharing_mode(SharingMode::Exclusive)
@@ -980,7 +1145,8 @@ fn start_oboe_stream(
 
 #[cfg(target_os = "android")]
 struct SamplerCallback {
-    state: Arc<Mutex<SamplerState>>,
+    state:       Arc<Mutex<SamplerState>>,
+    remote_cons: HeapConsumer<f32>,
 }
 
 #[cfg(target_os = "android")]
@@ -1000,12 +1166,107 @@ impl oboe::AudioOutputCallback for SamplerCallback {
             s.process(&mut buf_l, &mut buf_r);
         }
 
+        // Mix in remote audio: interleaved f32 stereo (L, R, L, R, …)
+        let mut rbuf = vec![0f32; n * 2];
+        let got = self.remote_cons.pop_slice(&mut rbuf);
+        for i in 0..(got / 2) {
+            buf_l[i] += rbuf[i * 2];
+            buf_r[i] += rbuf[i * 2 + 1];
+        }
+
         for (i, (l, r)) in frames.iter_mut().enumerate() {
             *l = buf_l[i];
             *r = buf_r[i];
         }
 
         oboe::DataCallbackResult::Continue
+    }
+}
+
+// ── Remote audio streaming (PCM WebSocket → Oboe ring buffer) ─────────────────
+
+struct AndroidRemoteAudio {
+    connected: Arc<AtomicBool>,
+    active:    Arc<AtomicBool>,
+    ws_url:    Arc<Mutex<String>>,
+}
+
+impl AndroidRemoteAudio {
+    fn new(prod: HeapProducer<f32>) -> Self {
+        let connected = Arc::new(AtomicBool::new(false));
+        let active    = Arc::new(AtomicBool::new(false));
+        let ws_url    = Arc::new(Mutex::new(String::new()));
+
+        let connected2 = Arc::clone(&connected);
+        let active2    = Arc::clone(&active);
+        let ws_url2    = Arc::clone(&ws_url);
+
+        thread::Builder::new().name("remote-audio".into()).spawn(move || {
+            remote_audio_loop(prod, connected2, active2, ws_url2);
+        }).expect("spawn remote-audio");
+
+        Self { connected, active, ws_url }
+    }
+}
+
+impl RemoteAudioPlayer for AndroidRemoteAudio {
+    fn connect(&mut self, pcm_ws_url: &str) {
+        *self.ws_url.lock().unwrap() = pcm_ws_url.to_string();
+        self.connected.store(true, Ordering::SeqCst);
+    }
+
+    fn disconnect(&mut self) {
+        self.connected.store(false, Ordering::SeqCst);
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+    }
+}
+
+fn remote_audio_loop(
+    mut prod:  HeapProducer<f32>,
+    connected: Arc<AtomicBool>,
+    active:    Arc<AtomicBool>,
+    ws_url:    Arc<Mutex<String>>,
+) {
+    loop {
+        // Wait until connect() is called.
+        while !connected.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let url = ws_url.lock().unwrap().clone();
+        let (_sender, receiver) = match ewebsock::connect(&url, ewebsock::Options::default()) {
+            Ok(pair) => pair,
+            Err(_) => {
+                connected.store(false, Ordering::SeqCst);
+                continue;
+            }
+        };
+        active.store(true, Ordering::SeqCst);
+
+        while connected.load(Ordering::Relaxed) {
+            while let Some(ev) = receiver.try_recv() {
+                match ev {
+                    ewebsock::WsEvent::Message(ewebsock::WsMessage::Binary(data)) => {
+                        // data: i16 LE stereo — convert to f32 and push to ring buffer.
+                        for chunk in data.chunks_exact(2) {
+                            let s = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0;
+                            let _ = prod.push(s);
+                        }
+                    }
+                    ewebsock::WsEvent::Closed | ewebsock::WsEvent::Error(_) => {
+                        connected.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        active.store(false, Ordering::SeqCst);
     }
 }
 

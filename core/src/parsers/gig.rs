@@ -66,14 +66,14 @@ fn read_inam(d: &[u8], cs: usize, csz: usize) -> Option<String> {
 // ── Wave decoding ─────────────────────────────────────────────────────────────
 
 struct WaveInfo {
-    pcm: Arc<Vec<f32>>,
+    pcm: Arc<Vec<i16>>,
     frames: usize,
     loop_start: Option<usize>,
     loop_end: Option<usize>,
 }
 
 /// Decode one LIST(wave) starting at absolute offset `wave_pos` in `d`.
-/// Returns the interleaved stereo f32 PCM and loop points (exclusive end).
+/// Returns the interleaved stereo i16 PCM and loop points (exclusive end).
 fn decode_wave(d: &[u8], wave_pos: usize) -> Option<WaveInfo> {
     if wave_pos + 12 > d.len() { return None; }
     if &d[wave_pos..wave_pos+4] != b"LIST" { return None; }
@@ -133,23 +133,23 @@ fn decode_wave(d: &[u8], wave_pos: usize) -> Option<WaveInfo> {
     if frame_bytes == 0 { return None; }
     let n_frames = pcm_size / frame_bytes;
 
-    let mut pcm: Vec<f32> = Vec::with_capacity(n_frames * 2);
+    let mut pcm: Vec<i16> = Vec::with_capacity(n_frames * 2);
 
     if channels == 2 {
         let n_samples = n_frames * 2;
         for i in 0..n_samples {
             let off = pcm_start + i * 2;
             if off + 2 > d.len() { break; }
-            pcm.push(i16::from_le_bytes([d[off], d[off+1]]) as f32 / 32768.0);
+            pcm.push(i16::from_le_bytes([d[off], d[off+1]]));
         }
     } else {
         // Mono → duplicate to stereo
         for i in 0..n_frames {
             let off = pcm_start + i * 2;
             if off + 2 > d.len() { break; }
-            let sf = i16::from_le_bytes([d[off], d[off+1]]) as f32 / 32768.0;
-            pcm.push(sf);
-            pcm.push(sf);
+            let s = i16::from_le_bytes([d[off], d[off+1]]);
+            pcm.push(s);
+            pcm.push(s);
         }
     }
 

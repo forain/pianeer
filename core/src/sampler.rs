@@ -8,10 +8,10 @@ use ringbuf::HeapProducer;
 
 use crate::region::{Region, Trigger};
 
-/// A loaded audio sample — stereo interleaved f32 PCM.
+/// A loaded audio sample — stereo interleaved i16 PCM.
 pub struct LoadedSample {
-    /// Stereo interleaved frames: [L0, R0, L1, R1, …]
-    pub data: std::sync::Arc<Vec<f32>>,
+    /// Stereo interleaved frames: [L0, R0, L1, R1, …] stored as i16 to halve RAM usage.
+    pub data: std::sync::Arc<Vec<i16>>,
     /// Number of stereo frames.
     pub frames: usize,
     /// Loop start position in frames (None = no loop).
@@ -758,13 +758,13 @@ impl SamplerState {
         let best_start = (search_start..=search_end.saturating_sub(WIN))
             .step_by(step)
             .max_by(|&a, &b| {
-                let ea: f32 = sample.data[a * 2..(a + WIN) * 2].iter().map(|&x| x * x).sum();
-                let eb: f32 = sample.data[b * 2..(b + WIN) * 2].iter().map(|&x| x * x).sum();
+                let ea: f32 = sample.data[a * 2..(a + WIN) * 2].iter().map(|&x| (x as f32).powi(2)).sum();
+                let eb: f32 = sample.data[b * 2..(b + WIN) * 2].iter().map(|&x| (x as f32).powi(2)).sum();
                 ea.partial_cmp(&eb).unwrap()
             })
             .unwrap_or(search_start);
         let mono: Vec<f32> = (0..WIN)
-            .map(|i| sample.data[(best_start + i) * 2])
+            .map(|i| sample.data[(best_start + i) * 2] as f32 * (1.0 / 32768.0))
             .collect();
 
         // Expected raw-sample frequency = 440 Hz / playback-rate-for-note-69.
@@ -888,11 +888,11 @@ fn hermite(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
     ((a * t + b) * t + c) * t + p1
 }
 
-/// Read one stereo frame from interleaved PCM data, clamping to the last valid frame.
+/// Read one stereo frame from interleaved i16 PCM, clamping to the last valid frame.
 #[inline]
-fn sample_at(data: &[f32], frames: usize, i: usize) -> (f32, f32) {
+fn sample_at(data: &[i16], frames: usize, i: usize) -> (f32, f32) {
     let i = i.min(frames.saturating_sub(1));
-    (data[i * 2], data[i * 2 + 1])
+    (data[i * 2] as f32 * (1.0 / 32768.0), data[i * 2 + 1] as f32 * (1.0 / 32768.0))
 }
 
 fn begin_release(v: &mut Voice) {

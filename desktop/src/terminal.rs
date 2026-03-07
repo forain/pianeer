@@ -18,40 +18,40 @@ fn raw_off() {
     terminal::disable_raw_mode().ok();
 }
 
-use pianeer_core::loader::load_instrument_data;
+use pianeer_core::dispatch::{apply_settings_action, rebuild_menu};
+use pianeer_core::loader::{load_instrument_data, save_last_instrument_path};
 use pianeer_core::sampler::{MidiEvent, SamplerState};
-use pianeer_core::{instruments, midi_player, midi_recorder};
+use pianeer_core::{midi_player, midi_recorder};
 use pianeer_core::snapshot::build_snapshot;
-use pianeer_core::sys_stats::{read_cpu_ticks, read_mem_mb};
+use pianeer_core::sys_stats::StatsCollector;
 use pianeer_core::types::{
     MenuAction, MenuItem, PlaybackInfo, PlaybackState, ProcStats, Settings,
-    stop_playback, playing_idx,
+    stop_playback, playing_idx, pause_resume, seek_relative,
 };
 use crate::ui::{print_menu, print_qr_modal};
 
 pub fn run_terminal(
-    mut menu:       Vec<MenuItem>,
-    state:          Arc<Mutex<SamplerState>>,
-    midi_tx:        Sender<MidiEvent>,
-    record_handle:  pianeer_core::midi_recorder::RecordHandle,
-    midi_dir:       Option<std::path::PathBuf>,
-    samples_dir:    std::path::PathBuf,
-    web_snapshot:   Arc<Mutex<String>>,
-    action_tx:      Sender<MenuAction>,
-    action_rx:      Receiver<MenuAction>,
-    mut auto_tune:  f32,
-    quit:           Arc<AtomicBool>,
-    reload:         Arc<AtomicBool>,
-    show_qr:        Arc<AtomicBool>,
+    mut menu:        Vec<MenuItem>,
+    state:           Arc<Mutex<SamplerState>>,
+    midi_tx:         Sender<MidiEvent>,
+    record_handle:   pianeer_core::midi_recorder::RecordHandle,
+    midi_dir:        Option<std::path::PathBuf>,
+    samples_dir:     std::path::PathBuf,
+    web_snapshot:    Arc<Mutex<String>>,
+    action_tx:       Sender<MenuAction>,
+    action_rx:       Receiver<MenuAction>,
+    mut auto_tune:   f32,
+    quit:            Arc<AtomicBool>,
+    reload:          Arc<AtomicBool>,
+    show_qr:         Arc<AtomicBool>,
+    initial_current: usize,
 ) {
     raw_on();
 
     let mut settings = Settings::default();
     let mut sustain_prev = false;
     let mut stats = ProcStats::default();
-    let mut prev_cpu_ticks: u64 = read_cpu_ticks().unwrap_or(0);
-    let mut prev_cpu_instant = std::time::Instant::now();
-    let mut clip_until: Option<std::time::Instant> = None;
+    let mut stats_collector = StatsCollector::new();
 
     let mk_pb_info = |pb: &Option<PlaybackState>| -> Option<PlaybackInfo> {
         pb.as_ref()
@@ -146,11 +146,12 @@ pub fn run_terminal(
     }
 
     // Main loop: handle quit, reload, instrument switches, and MIDI file playback.
-    let mut current = 0usize;
-    let mut current_path = menu.iter()
-        .find_map(|m| if let MenuItem::Instrument(i) = m { Some(i.path().clone()) } else { None })
+    let state_file = samples_dir.join(".last_instrument");
+    let mut current = initial_current;
+    let mut current_path = menu.get(initial_current)
+        .and_then(|m| if let MenuItem::Instrument(i) = m { Some(i.path().clone()) } else { None })
         .unwrap_or_default();
-    let mut cursor = 0usize;
+    let mut cursor = initial_current;
     let mut playback: Option<PlaybackState> = None;
 
     loop {
@@ -163,46 +164,18 @@ pub fn run_terminal(
             break;
         }
 
-        let (sustain_now, voices_now, peak_l, peak_r, clip_now) = state.try_lock()
-            .map(|mut s| {
-                let clip = s.clip_l || s.clip_r;
-                s.clip_l = false;
-                s.clip_r = false;
-                (s.sustain_pedal, s.active_voice_count(), s.peak_l, s.peak_r, clip)
-            })
-            .unwrap_or((sustain_prev, stats.voices, stats.peak_l, stats.peak_r, false));
-
-        let now = std::time::Instant::now();
-        if clip_now {
-            clip_until = Some(now + Duration::from_secs(2));
-        }
-        let clip_holding = clip_until.map(|t| now < t).unwrap_or(false);
-
-        let elapsed = now.duration_since(prev_cpu_instant).as_secs_f32().max(0.001);
-        let ticks_now = read_cpu_ticks().unwrap_or(prev_cpu_ticks);
-        let cpu_pct = (((ticks_now.saturating_sub(prev_cpu_ticks)) as f32 / 100.0) / elapsed * 100.0)
-            .round().clamp(0.0, 100.0) as u8;
-        prev_cpu_ticks = ticks_now;
-        prev_cpu_instant = now;
-
-        let new_stats = ProcStats {
-            cpu_pct,
-            mem_mb: read_mem_mb(),
-            voices: voices_now,
-            peak_l,
-            peak_r,
-            clip: clip_holding,
-        };
+        let prev_stats = stats.clone();
+        let prev_sustain = sustain_prev;
+        let sustain_now;
+        (stats, sustain_now) = stats_collector.tick(&state);
+        sustain_prev = sustain_now;
 
         let active_playback = playback.as_ref().map(|p| !p.done.load(Ordering::Relaxed)).unwrap_or(false);
         let recording_active = midi_recorder::is_recording(&record_handle);
-        let needs_redraw = sustain_now != sustain_prev
-            || new_stats != stats
+        let needs_redraw = sustain_now != prev_sustain
+            || stats != prev_stats
             || active_playback
             || recording_active;
-
-        sustain_prev = sustain_now;
-        stats = new_stats;
 
         let pb_info = mk_pb_info(&playback);
         let rec_elapsed = midi_recorder::elapsed(&record_handle);
@@ -215,6 +188,7 @@ pub fn run_terminal(
                 recording_active,
                 rec_elapsed.map(|d| d.as_micros() as u64),
                 pb_info.as_ref(),
+                None,
             );
             if let Ok(json) = serde_json::to_string(&snap) {
                 if let Ok(mut s) = web_snapshot.lock() { *s = json; }
@@ -231,30 +205,9 @@ pub fn run_terminal(
 
         // Rescan on R.
         if reload.swap(false, Ordering::SeqCst) {
-            let saved_path = match menu.get(current) {
-                Some(MenuItem::Instrument(i)) => Some(i.path().clone()),
-                _ => None,
-            };
-            let new_instruments = instruments::discover(&samples_dir);
-            let new_midi = match midi_dir.as_ref() {
-                Some(dir) => midi_player::discover(dir),
-                None => Vec::new(),
-            };
-            let mut new_menu: Vec<MenuItem> =
-                new_instruments.into_iter().map(MenuItem::Instrument).collect();
-            for (name, path) in new_midi {
-                new_menu.push(MenuItem::MidiFile { name, path });
-            }
-            current = saved_path
-                .and_then(|p| new_menu.iter().position(|m| {
-                    matches!(m, MenuItem::Instrument(i) if i.path() == &p)
-                }))
-                .unwrap_or(0);
-            cursor = cursor.min(new_menu.len().saturating_sub(1));
-            menu = new_menu;
-            current_path = menu.get(current)
-                .and_then(|m| if let MenuItem::Instrument(i) = m { Some(i.path().clone()) } else { None })
-                .unwrap_or_default();
+            (menu, current, cursor, current_path) = rebuild_menu(
+                &samples_dir, midi_dir.as_deref(), &menu, current, cursor,
+            );
             show_qr.store(false, Ordering::Relaxed);
             let pb_info = mk_pb_info(&playback);
             let rec_elapsed = midi_recorder::elapsed(&record_handle);
@@ -315,66 +268,6 @@ pub fn run_terminal(
                     print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
                         midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
                 }
-                MenuAction::CycleVeltrack => {
-                    settings.veltrack = settings.veltrack.cycle();
-                    if let Ok(ref mut s) = state.lock() {
-                        s.veltrack_override = settings.veltrack.override_pct();
-                    }
-                    let pb_info = mk_pb_info(&playback);
-                    let rec_elapsed = midi_recorder::elapsed(&record_handle);
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
-                        midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
-                }
-                MenuAction::CycleTune => {
-                    settings.tune = settings.tune.cycle();
-                    if let Ok(ref mut s) = state.lock() {
-                        s.master_tune_semitones = auto_tune + settings.tune.semitones();
-                    }
-                    let pb_info = mk_pb_info(&playback);
-                    let rec_elapsed = midi_recorder::elapsed(&record_handle);
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
-                        midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
-                }
-                MenuAction::ToggleRelease => {
-                    settings.release_enabled = !settings.release_enabled;
-                    if let Ok(ref mut s) = state.lock() {
-                        s.release_enabled = settings.release_enabled;
-                    }
-                    let pb_info = mk_pb_info(&playback);
-                    let rec_elapsed = midi_recorder::elapsed(&record_handle);
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
-                        midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
-                }
-                MenuAction::VolumeChange(delta) => {
-                    settings.volume_db = (settings.volume_db + delta as f32 * 3.0).clamp(-12.0, 12.0);
-                    if let Ok(ref mut s) = state.lock() {
-                        s.master_volume = 10.0_f32.powf(settings.volume_db / 20.0);
-                    }
-                    let pb_info = mk_pb_info(&playback);
-                    let rec_elapsed = midi_recorder::elapsed(&record_handle);
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
-                        midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
-                }
-                MenuAction::TransposeChange(delta) => {
-                    settings.transpose = (settings.transpose + delta as i32).clamp(-12, 12);
-                    if let Ok(ref mut s) = state.lock() {
-                        s.transpose = settings.transpose;
-                    }
-                    let pb_info = mk_pb_info(&playback);
-                    let rec_elapsed = midi_recorder::elapsed(&record_handle);
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
-                        midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
-                }
-                MenuAction::ToggleResonance => {
-                    settings.resonance_enabled = !settings.resonance_enabled;
-                    if let Ok(ref mut s) = state.lock() {
-                        s.resonance_enabled = settings.resonance_enabled;
-                    }
-                    let pb_info = mk_pb_info(&playback);
-                    let rec_elapsed = midi_recorder::elapsed(&record_handle);
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
-                        midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
-                }
                 MenuAction::ToggleRecord => {
                     if midi_recorder::is_recording(&record_handle) {
                         if let Some(buf) = midi_recorder::stop(&record_handle) {
@@ -405,27 +298,14 @@ pub fn run_terminal(
                         midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
                 }
                 MenuAction::PauseResume => {
-                    if let Some(ref pb) = playback {
-                        if !pb.done.load(Ordering::Relaxed) {
-                            let was_paused = pb.paused.load(Ordering::Relaxed);
-                            pb.paused.store(!was_paused, Ordering::Relaxed);
-                        }
-                    }
+                    pause_resume(&playback);
                     let pb_info = mk_pb_info(&playback);
                     let rec_elapsed = midi_recorder::elapsed(&record_handle);
                     print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
                         midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
                 }
                 MenuAction::SeekRelative(secs) => {
-                    if let Some(ref pb) = playback {
-                        if !pb.done.load(Ordering::Relaxed) {
-                            let cur = pb.current_us.load(Ordering::Relaxed);
-                            let offset = secs * 1_000_000i64;
-                            let new_pos = (cur as i64 + offset)
-                                .clamp(0, pb.total_us as i64) as u64;
-                            pb.seek_to.store(new_pos, Ordering::Relaxed);
-                        }
-                    }
+                    seek_relative(&playback, secs);
                     let pb_info = mk_pb_info(&playback);
                     let rec_elapsed = midi_recorder::elapsed(&record_handle);
                     print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
@@ -433,74 +313,17 @@ pub fn run_terminal(
                 }
                 MenuAction::SelectAt(target) => {
                     cursor = target.min(menu.len().saturating_sub(1));
-                    let idx = cursor;
-                    match &menu[idx] {
-                        MenuItem::Instrument(inst)
-                            if idx != current || inst.path() != &current_path =>
-                        {
-                            while action_rx.try_recv().is_ok() {}
-                            raw_off();
-                            println!("\r\nLoading {}...", inst.name);
-                            let new_path = inst.path().clone();
-                            match load_instrument_data(inst) {
-                                Ok(loaded) => {
-                                    if let Ok(ref mut s) = state.lock() {
-                                        s.swap_instrument(
-                                            loaded.regions, loaded.samples,
-                                            loaded.cc_defaults,
-                                            loaded.sw_lokey, loaded.sw_hikey, loaded.sw_default,
-                                        );
-                                        auto_tune = s.detect_a4_tune_correction();
-                                        s.master_tune_semitones = auto_tune + settings.tune.semitones();
-                                    }
-                                    current = idx;
-                                    current_path = new_path;
-                                }
-                                Err(e) => eprintln!("Error loading instrument: {}", e),
-                            }
-                            raw_on();
-                            let pb_info = mk_pb_info(&playback);
-                            let rec_elapsed = midi_recorder::elapsed(&record_handle);
-                            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
-                                midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
-                        }
-                        MenuItem::MidiFile { path, .. } => {
-                            let path = path.clone();
-                            let already_playing = playback.as_ref()
-                                .map_or(false, |p| p.menu_idx == idx && !p.done.load(Ordering::Relaxed));
-                            stop_playback(&mut playback);
-                            if !already_playing {
-                                let stop_flag   = Arc::new(AtomicBool::new(false));
-                                let done_flag   = Arc::new(AtomicBool::new(false));
-                                let paused_flag = Arc::new(AtomicBool::new(false));
-                                let cur_us      = Arc::new(AtomicU64::new(0));
-                                let seek_flag   = Arc::new(AtomicU64::new(u64::MAX));
-                                let (handle, total_us) = midi_player::spawn(
-                                    path, midi_tx.clone(),
-                                    Arc::clone(&stop_flag), Arc::clone(&done_flag),
-                                    Arc::clone(&paused_flag), Arc::clone(&cur_us),
-                                    Arc::clone(&seek_flag),
-                                );
-                                playback = Some(PlaybackState {
-                                    stop: stop_flag, done: done_flag,
-                                    paused: paused_flag,
-                                    current_us: cur_us, total_us,
-                                    seek_to: seek_flag,
-                                    _handle: handle, menu_idx: idx,
-                                });
-                            }
-                            let pb_info = mk_pb_info(&playback);
-                            let rec_elapsed = midi_recorder::elapsed(&record_handle);
-                            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
-                                midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
-                        }
-                        _ => {
-                            let pb_info = mk_pb_info(&playback);
-                            let rec_elapsed = midi_recorder::elapsed(&record_handle);
-                            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
-                                midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
-                        }
+                    let prev_path = current_path.clone();
+                    term_do_select(cursor, &menu, &mut current, &mut current_path,
+                                   &mut auto_tune, &settings, &state, &midi_tx,
+                                   &mut playback, &action_rx);
+                    if current_path != prev_path && !current_path.as_os_str().is_empty() {
+                        save_last_instrument_path(&state_file, &current_path);
                     }
+                    let pb_info = mk_pb_info(&playback);
+                    let rec_elapsed = midi_recorder::elapsed(&record_handle);
+                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
+                        midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
                 }
                 MenuAction::ShowQr => {
                     let new_val = !show_qr.load(Ordering::Relaxed);
@@ -519,70 +342,101 @@ pub fn run_terminal(
                 }
                 MenuAction::Select => {
                     let idx = cursor;
-                    match &menu[idx] {
+                    let needs_redraw = match &menu[idx] {
                         MenuItem::Instrument(inst)
-                            if idx != current || inst.path() != &current_path =>
-                        {
-                            while action_rx.try_recv().is_ok() {}
-                            raw_off();
-                            println!("\r\nLoading {}...", inst.name);
-                            let new_path = inst.path().clone();
-                            match load_instrument_data(inst) {
-                                Ok(loaded) => {
-                                    if let Ok(ref mut s) = state.lock() {
-                                        s.swap_instrument(
-                                            loaded.regions, loaded.samples,
-                                            loaded.cc_defaults,
-                                            loaded.sw_lokey, loaded.sw_hikey, loaded.sw_default,
-                                        );
-                                        auto_tune = s.detect_a4_tune_correction();
-                                        s.master_tune_semitones = auto_tune + settings.tune.semitones();
-                                    }
-                                    current = idx;
-                                    current_path = new_path;
-                                }
-                                Err(e) => eprintln!("Error loading instrument: {}", e),
-                            }
-                            raw_on();
-                            let pb_info = mk_pb_info(&playback);
-                            let rec_elapsed = midi_recorder::elapsed(&record_handle);
-                            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
-                                midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
-                        }
-                        MenuItem::MidiFile { path, .. } => {
-                            let path = path.clone();
-                            let already_playing = playback.as_ref()
-                                .map_or(false, |p| p.menu_idx == idx && !p.done.load(Ordering::Relaxed));
-                            stop_playback(&mut playback);
-                            if !already_playing {
-                                let stop_flag   = Arc::new(AtomicBool::new(false));
-                                let done_flag   = Arc::new(AtomicBool::new(false));
-                                let paused_flag = Arc::new(AtomicBool::new(false));
-                                let cur_us      = Arc::new(AtomicU64::new(0));
-                                let seek_flag   = Arc::new(AtomicU64::new(u64::MAX));
-                                let (handle, total_us) = midi_player::spawn(
-                                    path, midi_tx.clone(),
-                                    Arc::clone(&stop_flag), Arc::clone(&done_flag),
-                                    Arc::clone(&paused_flag), Arc::clone(&cur_us),
-                                    Arc::clone(&seek_flag),
-                                );
-                                playback = Some(PlaybackState {
-                                    stop: stop_flag, done: done_flag,
-                                    paused: paused_flag,
-                                    current_us: cur_us, total_us,
-                                    seek_to: seek_flag,
-                                    _handle: handle, menu_idx: idx,
-                                });
-                            }
-                            let pb_info = mk_pb_info(&playback);
-                            let rec_elapsed = midi_recorder::elapsed(&record_handle);
-                            print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
-                                midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
-                        }
-                        _ => {}
+                            if idx != current || inst.path() != &current_path => true,
+                        MenuItem::MidiFile { .. } => true,
+                        _ => false,
+                    };
+                    let prev_path = current_path.clone();
+                    term_do_select(idx, &menu, &mut current, &mut current_path,
+                                   &mut auto_tune, &settings, &state, &midi_tx,
+                                   &mut playback, &action_rx);
+                    if current_path != prev_path && !current_path.as_os_str().is_empty() {
+                        save_last_instrument_path(&state_file, &current_path);
+                    }
+                    if needs_redraw {
+                        let pb_info = mk_pb_info(&playback);
+                        let rec_elapsed = midi_recorder::elapsed(&record_handle);
+                        print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
+                            midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
+                    }
+                }
+                action => {
+                    if apply_settings_action(&action, &mut settings, auto_tune, &state) {
+                        let pb_info = mk_pb_info(&playback);
+                        let rec_elapsed = midi_recorder::elapsed(&record_handle);
+                        print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
+                            midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
                     }
                 }
             }
         }
+    }
+}
+
+fn term_do_select(
+    idx:          usize,
+    menu:         &[MenuItem],
+    current:      &mut usize,
+    current_path: &mut std::path::PathBuf,
+    auto_tune:    &mut f32,
+    settings:     &Settings,
+    state:        &Arc<Mutex<SamplerState>>,
+    midi_tx:      &Sender<MidiEvent>,
+    playback:     &mut Option<PlaybackState>,
+    action_rx:    &Receiver<MenuAction>,
+) {
+    if idx >= menu.len() { return; }
+    match &menu[idx] {
+        MenuItem::Instrument(inst) if idx != *current || inst.path() != current_path.as_path() => {
+            while action_rx.try_recv().is_ok() {}
+            raw_off();
+            println!("\r\nLoading {}...", inst.name);
+            let new_path = inst.path().clone();
+            match load_instrument_data(inst, &Arc::new(std::sync::atomic::AtomicU32::new(0))) {
+                Ok(loaded) => {
+                    if let Ok(ref mut s) = state.lock() {
+                        s.swap_instrument(
+                            loaded.regions, loaded.samples, loaded.cc_defaults,
+                            loaded.sw_lokey, loaded.sw_hikey, loaded.sw_default,
+                        );
+                        *auto_tune = s.detect_a4_tune_correction();
+                        s.master_tune_semitones = *auto_tune + settings.tune.semitones();
+                    }
+                    *current = idx;
+                    *current_path = new_path;
+                }
+                Err(e) => eprintln!("Error loading instrument: {}", e),
+            }
+            raw_on();
+        }
+        MenuItem::MidiFile { path, .. } => {
+            let path = path.clone();
+            let already_playing = playback.as_ref()
+                .map_or(false, |p| p.menu_idx == idx && !p.done.load(Ordering::Relaxed));
+            stop_playback(playback);
+            if !already_playing {
+                let stop_flag   = Arc::new(AtomicBool::new(false));
+                let done_flag   = Arc::new(AtomicBool::new(false));
+                let paused_flag = Arc::new(AtomicBool::new(false));
+                let cur_us      = Arc::new(AtomicU64::new(0));
+                let seek_flag   = Arc::new(AtomicU64::new(u64::MAX));
+                let (handle, total_us) = midi_player::spawn(
+                    path, midi_tx.clone(),
+                    Arc::clone(&stop_flag), Arc::clone(&done_flag),
+                    Arc::clone(&paused_flag), Arc::clone(&cur_us),
+                    Arc::clone(&seek_flag),
+                );
+                *playback = Some(PlaybackState {
+                    stop: stop_flag, done: done_flag,
+                    paused: paused_flag,
+                    current_us: cur_us, total_us,
+                    seek_to: seek_flag,
+                    _handle: handle, menu_idx: idx,
+                });
+            }
+        }
+        _ => {}
     }
 }

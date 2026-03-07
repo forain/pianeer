@@ -3,7 +3,12 @@ use std::time::Duration;
 use egui::{CentralPanel, Color32, FontId, RichText, ScrollArea, SidePanel, TopBottomPanel, Ui};
 use pianeer_core::snapshot::{ClientCmd, WebSnapshot};
 
-use crate::PianeerBackend;
+use crate::{PianeerBackend, RemoteBackend};
+
+#[cfg(target_arch = "wasm32")]
+use crate::wasm_audio::AudioPlayer;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::remote_audio::RemoteAudioPlayer;
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
@@ -14,6 +19,16 @@ pub struct PianeerApp {
     /// Pre-computed QR modules (dark=true, row-major) and module count.
     qr_data:       Option<(Vec<bool>, usize)>,
     server_url:    String,
+    // Remote connection
+    connect_input:  String,
+    connect_error:  Option<String>,
+    is_remote:      bool,
+    // WASM audio streaming
+    #[cfg(target_arch = "wasm32")]
+    audio_player:   Option<AudioPlayer>,
+    // Native (Android/desktop) remote audio streaming
+    #[cfg(not(target_arch = "wasm32"))]
+    remote_audio:   Option<Box<dyn RemoteAudioPlayer>>,
 }
 
 impl PianeerApp {
@@ -26,7 +41,58 @@ impl PianeerApp {
                 .collect();
             (dark, n)
         });
-        Self { backend, settings_open: false, show_qr: false, qr_data, server_url }
+
+        // Pre-fill the connect input with the current server's host:port.
+        let connect_input = server_url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .to_string();
+
+        // WASM always starts connected to a remote backend.
+        #[cfg(target_arch = "wasm32")]
+        let is_remote = true;
+        #[cfg(not(target_arch = "wasm32"))]
+        let is_remote = false;
+
+        Self {
+            backend,
+            settings_open: false,
+            show_qr: false,
+            qr_data,
+            server_url,
+            connect_input,
+            connect_error: None,
+            is_remote,
+            #[cfg(target_arch = "wasm32")]
+            audio_player: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            remote_audio: None,
+        }
+    }
+
+    /// Provide a platform audio player for remote streaming (Android/desktop).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_remote_audio(&mut self, player: Box<dyn RemoteAudioPlayer>) {
+        self.remote_audio = Some(player);
+    }
+
+    pub fn is_remote(&self) -> bool { self.is_remote }
+
+    /// Current value of the remote-connect text field (for pre-filling dialogs).
+    pub fn get_connect_input(&self) -> &str {
+        &self.connect_input
+    }
+
+    /// Accept a text result from a platform dialog, update connect_input and connect.
+    pub fn handle_connect_result(&mut self, text: String) {
+        self.connect_input = text.clone();
+        do_connect(
+            &mut self.backend,
+            &text,
+            &mut self.is_remote,
+            &mut self.connect_error,
+            &mut self.server_url,
+        );
     }
 }
 
@@ -37,28 +103,63 @@ impl PianeerApp {
         self.backend.poll();
         let snap = self.backend.snapshot().clone();
 
-        // Repaint at ~20 Hz so VU meters and playback progress stay live.
-        ctx.request_repaint_after(Duration::from_millis(50));
+        // Poll audio player if streaming.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(ref mut ap) = self.audio_player {
+            ap.poll();
+        }
+
+        // Repaint frequently only when something is visually changing.
+        let animating = snap.playback.is_some()
+            || snap.loading.is_some()
+            || snap.stats.voices > 0
+            || snap.stats.peak_l > 0.001
+            || snap.stats.peak_r > 0.001
+            || snap.rec_elapsed_us.is_some();
+        // Audio scheduling is driven by a JS timer, not the repaint cycle.
+        ctx.request_repaint_after(Duration::from_millis(if animating { 50 } else { 500 }));
 
         let portrait = ctx.screen_rect().width() < 520.0;
 
         if portrait {
-            // Larger touch targets on mobile.
             ctx.style_mut(|s| s.spacing.interact_size.y = 36.0);
         }
 
         render_stats_bar(ctx, &snap, portrait);
 
+        // WASM audio button — thin strip at the bottom.
+        #[cfg(target_arch = "wasm32")]
+        render_audio_bar(ctx, &self.server_url, &mut self.audio_player);
+
         if portrait {
-            render_settings_bottom(ctx, &snap, &mut *self.backend, &mut self.settings_open, &mut self.show_qr);
+            render_settings_bottom(
+                ctx, &snap, &mut self.backend,
+                &mut self.settings_open, &mut self.show_qr,
+                &mut self.connect_input, &mut self.is_remote,
+                &mut self.connect_error, &mut self.server_url,
+            );
         } else {
-            render_settings_panel(ctx, &snap, &mut *self.backend, &mut self.show_qr);
+            render_settings_panel(
+                ctx, &snap, &mut self.backend, &mut self.show_qr,
+                &mut self.connect_input, &mut self.is_remote,
+                &mut self.connect_error, &mut self.server_url,
+            );
         }
 
         render_main(ctx, &snap, &mut *self.backend);
 
         if self.show_qr {
             render_qr_window(ctx, &self.server_url, &self.qr_data, &mut self.show_qr);
+        }
+
+        // Native remote audio floating button (Android/desktop) — rendered last
+        // so it floats above all panels, clear of the system navigation bar.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.is_remote {
+            if let Some(ref mut player) = self.remote_audio {
+                let server_url = self.server_url.clone();
+                render_listen_window(ctx, &server_url, &mut **player);
+            }
         }
     }
 }
@@ -67,6 +168,72 @@ impl eframe::App for PianeerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_egui(ctx);
     }
+}
+
+// ── WASM audio bar ────────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "wasm32")]
+fn render_audio_bar(ctx: &egui::Context, server_url: &str, player: &mut Option<AudioPlayer>) {
+    TopBottomPanel::bottom("audio_ctrl").show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            if player.is_none() {
+                if ui.button("🔊 Listen").clicked() {
+                    let ws_url = format!(
+                        "{}/audio-pcm-ws",
+                        server_url
+                            .replacen("http://", "ws://", 1)
+                            .replacen("https://", "wss://", 1)
+                    );
+                    if let Ok(p) = AudioPlayer::new(&ws_url) {
+                        *player = Some(p);
+                    }
+                }
+            } else {
+                if ui.button("🔇").clicked() {
+                    *player = None;
+                }
+                ui.label(
+                    RichText::new("● Live")
+                        .color(Color32::from_rgb(80, 192, 80))
+                        .strong(),
+                );
+            }
+        });
+    });
+}
+
+// ── Native remote audio floating window ──────────────────────────────────────
+
+#[cfg(not(target_arch = "wasm32"))]
+fn render_listen_window(ctx: &egui::Context, server_url: &str, player: &mut dyn RemoteAudioPlayer) {
+    egui::Window::new("listen_ctrl")
+        .title_bar(false)
+        .anchor(egui::Align2::RIGHT_BOTTOM, [-8.0, -72.0])
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if player.is_active() {
+                    if ui.button("🔇").clicked() {
+                        player.disconnect();
+                    }
+                    ui.label(
+                        RichText::new("● Live")
+                            .color(Color32::from_rgb(80, 192, 80))
+                            .strong(),
+                    );
+                } else {
+                    if ui.button("🔊 Listen").clicked() {
+                        let ws_url = format!(
+                            "{}/audio-pcm-ws",
+                            server_url
+                                .replacen("http://", "ws://", 1)
+                                .replacen("https://", "wss://", 1)
+                        );
+                        player.connect(&ws_url);
+                    }
+                }
+            });
+        });
 }
 
 // ── Stats / VU top bar ────────────────────────────────────────────────────────
@@ -83,8 +250,6 @@ fn render_stats_bar(ctx: &egui::Context, snap: &WebSnapshot, portrait: bool) {
             ui.separator();
 
             let s = &snap.stats;
-            // Each stat in its own fixed-width slot so changing one value
-            // never shifts the others' positions.
             stat_slot(ui, format!("CPU {:3}%", s.cpu_pct), 68.0);
             if !portrait {
                 stat_slot(ui, format!("{:4}MB", s.mem_mb), 58.0);
@@ -134,8 +299,6 @@ fn render_stats_bar(ctx: &egui::Context, snap: &WebSnapshot, portrait: bool) {
 }
 
 /// Allocate a fixed-width slot for a monospace stat label.
-/// The slot width is constant regardless of the value rendered inside it,
-/// so adjacent stats never shift each other.
 fn stat_slot(ui: &mut Ui, text: String, width: f32) {
     let h = ui.available_height();
     ui.add_sized(
@@ -164,22 +327,34 @@ fn vu_meter(ui: &mut Ui, label: &str, peak: f32, width: f32) {
 
 // ── Settings side panel (landscape / desktop) ─────────────────────────────────
 
-fn render_settings_panel(ctx: &egui::Context, snap: &WebSnapshot, backend: &mut dyn PianeerBackend, show_qr: &mut bool) {
+fn render_settings_panel(
+    ctx: &egui::Context,
+    snap: &WebSnapshot,
+    backend: &mut Box<dyn PianeerBackend>,
+    show_qr: &mut bool,
+    connect_input: &mut String,
+    is_remote: &mut bool,
+    connect_error: &mut Option<String>,
+    server_url: &mut String,
+) {
     SidePanel::right("settings").min_width(180.0).show(ctx, |ui| {
         ui.heading("Settings");
         ui.separator();
 
-        settings_controls(ui, snap, backend);
+        settings_controls(ui, snap, &mut **backend);
 
         ui.separator();
         if let Some(ref pb) = snap.playback {
-            playback_controls(ui, pb.paused, backend);
+            playback_controls(ui, pb.paused, &mut **backend);
             ui.separator();
         }
 
-        record_rescan(ui, snap.recording, backend);
+        record_rescan(ui, snap.recording, &mut **backend);
         ui.separator();
         if ui.button("QR Code").clicked() { *show_qr = !*show_qr; }
+
+        ui.separator();
+        connect_section(ui, backend, connect_input, is_remote, connect_error, server_url);
     });
 }
 
@@ -188,9 +363,13 @@ fn render_settings_panel(ctx: &egui::Context, snap: &WebSnapshot, backend: &mut 
 fn render_settings_bottom(
     ctx: &egui::Context,
     snap: &WebSnapshot,
-    backend: &mut dyn PianeerBackend,
+    backend: &mut Box<dyn PianeerBackend>,
     open: &mut bool,
     show_qr: &mut bool,
+    connect_input: &mut String,
+    is_remote: &mut bool,
+    connect_error: &mut Option<String>,
+    server_url: &mut String,
 ) {
     TopBottomPanel::bottom("settings_bottom").show(ctx, |ui| {
         // Toggle header row.
@@ -259,9 +438,13 @@ fn render_settings_bottom(
 
                 if let Some(ref pb) = snap.playback {
                     ui.separator();
-                    playback_controls(ui, pb.paused, backend);
+                    playback_controls(ui, pb.paused, &mut **backend);
                 }
             });
+
+            // Row 3: remote connect.
+            ui.separator();
+            connect_section_compact(ui, backend, connect_input, is_remote, connect_error, server_url);
         }
     });
 }
@@ -318,6 +501,93 @@ fn record_rescan(ui: &mut Ui, recording: bool, backend: &mut dyn PianeerBackend)
     if ui.button("⟳ Rescan").clicked() { backend.send(ClientCmd::Rescan); }
 }
 
+// ── Remote connect UI ─────────────────────────────────────────────────────────
+
+/// Full connect section for the landscape side panel.
+fn connect_section(
+    ui: &mut Ui,
+    backend: &mut Box<dyn PianeerBackend>,
+    input: &mut String,
+    is_remote: &mut bool,
+    error: &mut Option<String>,
+    server_url: &mut String,
+) {
+    ui.label(
+        RichText::new(if *is_remote { "Remote ✓" } else { "Remote" })
+            .color(if *is_remote { Color32::from_rgb(80, 192, 80) } else { Color32::from_gray(180) })
+            .small(),
+    );
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(input)
+            .hint_text("host:4000")
+            .desired_width(120.0));
+        if ui.button("Connect").clicked() {
+            do_connect(backend, input, is_remote, error, server_url);
+        }
+    });
+    if let Some(ref e) = *error {
+        ui.label(RichText::new(e.as_str()).color(Color32::RED).small());
+    }
+}
+
+/// Compact connect row for the portrait bottom drawer.
+fn connect_section_compact(
+    ui: &mut Ui,
+    backend: &mut Box<dyn PianeerBackend>,
+    input: &mut String,
+    is_remote: &mut bool,
+    error: &mut Option<String>,
+    server_url: &mut String,
+) {
+    ui.horizontal_wrapped(|ui| {
+        let label = if *is_remote { "🌐 ✓" } else { "🌐" };
+        ui.label(RichText::new(label).color(if *is_remote {
+            Color32::from_rgb(80, 192, 80)
+        } else {
+            Color32::from_gray(160)
+        }));
+        ui.add(egui::TextEdit::singleline(input)
+            .hint_text("host:4000")
+            .desired_width(110.0));
+        if ui.button("Connect").clicked() {
+            do_connect(backend, input, is_remote, error, server_url);
+        }
+        if let Some(ref e) = *error {
+            ui.label(RichText::new(e.as_str()).color(Color32::RED).small());
+        }
+    });
+}
+
+/// Replace the backend with a new RemoteBackend pointing at `input`.
+fn do_connect(
+    backend: &mut Box<dyn PianeerBackend>,
+    input: &str,
+    is_remote: &mut bool,
+    error: &mut Option<String>,
+    server_url: &mut String,
+) {
+    let host = input.trim()
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://")
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let host_port = if host.contains(':') {
+        host.to_string()
+    } else {
+        format!("{}:4000", host)
+    };
+    let ws_url = format!("ws://{}/ws", host_port);
+    match RemoteBackend::connect(&ws_url) {
+        Ok(new_backend) => {
+            *backend    = Box::new(new_backend);
+            *is_remote  = true;
+            *server_url = format!("http://{}", host_port);
+            *error      = None;
+        }
+        Err(e) => { *error = Some(e); }
+    }
+}
+
 // ── Instrument / MIDI file list ───────────────────────────────────────────────
 
 fn render_main(ctx: &egui::Context, snap: &WebSnapshot, backend: &mut dyn PianeerBackend) {
@@ -347,8 +617,10 @@ fn render_main(ctx: &egui::Context, snap: &WebSnapshot, backend: &mut dyn Pianee
 
                 egui::Frame::none().fill(bg).inner_margin(4.0).show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        let badge = if item.playing { "▶" } else if item.loaded { "✓" } else { "  " };
-                        ui.label(RichText::new(badge).color(name_color));
+                        let is_loading = snap.loading.map_or(false, |(li, _)| li == i);
+                        let badge = if is_loading { "⟳" } else if item.playing { "▶" } else if item.loaded { "✓" } else { "  " };
+                        let badge_color = if is_loading { Color32::from_rgb(80, 160, 255) } else { name_color };
+                        ui.label(RichText::new(badge).color(badge_color));
 
                         ui.label(RichText::new(&item.type_label).color(Color32::from_gray(85)).small());
 
@@ -367,6 +639,16 @@ fn render_main(ctx: &egui::Context, snap: &WebSnapshot, backend: &mut dyn Pianee
                             if ui.small_button("►").clicked() {
                                 backend.send(ClientCmd::CycleVariantAt { idx: i, dir: 1 });
                             }
+                        }
+
+                        if let Some((_, pct)) = snap.loading.filter(|(li, _)| *li == i) {
+                            let bar_w = 72.0_f32.min(ui.available_width() - 4.0).max(10.0);
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, 8.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 3.0, Color32::from_gray(50));
+                            let mut fill = rect;
+                            fill.set_right(rect.left() + rect.width() * pct as f32 / 100.0);
+                            ui.painter().rect_filled(fill, 3.0, Color32::from_rgb(60, 140, 255));
+                            ui.label(RichText::new(format!("{}%", pct)).color(Color32::from_gray(180)).small());
                         }
                     });
                 });
@@ -396,9 +678,7 @@ fn render_qr_window(
                     egui::vec2(side, side),
                     egui::Sense::hover(),
                 );
-                // White background (includes quiet zone).
                 ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
-                // Dark modules.
                 for y in 0..*n {
                     for x in 0..*n {
                         if dark[y * n + x] {

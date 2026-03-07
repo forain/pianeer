@@ -17,6 +17,7 @@ egui             = { version = "0.29" }
 winit            = { version = "0.30", default-features = false, features = ["android-native-activity"] }
 oboe             = { version = "0.6", features = ["java-interface"] }
 crossbeam-channel = "0.5"
+ewebsock          = "0.7"
 serde_json        = "1"
 log               = "0.4"
 android_logger    = "0.14"
@@ -28,6 +29,9 @@ label = "Pianeer"
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.WAKE_LOCK"
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.READ_EXTERNAL_STORAGE"
@@ -43,14 +47,12 @@ min_sdk_version    = 29
 target_sdk_version = 35
 compile_sdk_version = 35
 
-[[package.metadata.android.activity]]
-name        = "android.app.NativeActivity"
-orientation = "landscape"
-theme       = "@android:style/Theme.NoTitleBar"
-
 [package.metadata.android.application]
 debuggable = false
 request_legacy_external_storage = true
+
+[package.metadata.android.application.activity]
+config_changes = "orientation|keyboardHidden|screenSize|smallestScreenSize|screenLayout|uiMode|density|fontScale|layoutDirection"
 
 [package.metadata.android.signing.release]
 path       = "/run/media/forain/samsung970pro512/pianeer-release.jks"

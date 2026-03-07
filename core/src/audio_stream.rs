@@ -17,8 +17,9 @@ use tokio::sync::broadcast;
 
 // ── Public constants ────────────────────────────────────────────────────────
 
-/// Samples per FLAC block (stereo frames). Must match what the browser expects.
-pub const BLOCK_SAMPLES: usize = 256;
+/// Samples per FLAC/PCM block (stereo frames). Smaller = lower latency.
+/// 64 frames = 1.3 ms at 48 kHz.
+pub const BLOCK_SAMPLES: usize = 64;
 
 const CHANNELS: usize = 2;
 const BPS: u8 = 16; // bits per sample sent to browser
