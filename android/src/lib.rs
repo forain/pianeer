@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-/// Global InMemoryDexClassLoader holding all compiled app Java classes.
-/// Initialized once at startup; used by any thread that needs to call app Java code.
+/// Global InMemoryDexClassLoader holding all compiled app Kotlin classes.
+/// Initialized once at startup; used by any thread that needs to call app Kotlin code.
 static APP_CLASS_LOADER: OnceLock<jni::objects::GlobalRef> = OnceLock::new();
 
 use crossbeam_channel::bounded;
@@ -108,7 +108,7 @@ fn is_storage_manager(app: &android_activity::AndroidApp) -> bool {
     try_check(app).unwrap_or(false)
 }
 
-/// Load the app DEX (all compiled Java classes) into an InMemoryDexClassLoader
+/// Load the app DEX (all compiled Kotlin classes) into an InMemoryDexClassLoader
 /// and store it globally so any thread can call loadClass() on it.
 #[cfg(target_os = "android")]
 fn init_class_loader(app: &android_activity::AndroidApp) {
@@ -656,7 +656,7 @@ fn spawn_midi_api_thread(
     use jni::objects::{JClass, JObject, JObjectArray, JValueGen};
     use jni::JavaVM;
 
-    // DEX for MidiOpener.java — compiled by build.rs, embedded at build time.
+    // DEX for MidiOpener.kt — compiled by build.rs, embedded at build time.
     // InMemoryDexClassLoader (API 26+) loads it without touching the filesystem.
     const OPENER_DEX: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/midi_opener.dex"));
