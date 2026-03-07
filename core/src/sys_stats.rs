@@ -137,3 +137,19 @@ pub fn read_mem_mb() -> u32 {
 pub fn read_mem_mb() -> u32 {
     0
 }
+
+// ── Network ───────────────────────────────────────────────────────────────────
+
+/// Return the LAN-accessible HTTP URL for the given port using the UDP-connect
+/// trick (no packet sent; the OS selects the source IP for the route).
+/// Falls back to `localhost` if no LAN route is found.
+pub fn lan_server_url(port: u16) -> String {
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if sock.connect("1.1.1.1:80").is_ok() {
+            if let Ok(addr) = sock.local_addr() {
+                return format!("http://{}:{}", addr.ip(), port);
+            }
+        }
+    }
+    format!("http://localhost:{}", port)
+}

@@ -90,6 +90,39 @@ pub fn seek_relative(pb: &Option<PlaybackState>, secs: i64) {
     }
 }
 
+/// Spawn a MIDI file playback thread and store the resulting [`PlaybackState`].
+/// If `idx` is already playing it stops and does not restart (toggle behaviour).
+pub fn start_midi_playback(
+    idx:      usize,
+    path:     PathBuf,
+    midi_tx:  &crossbeam_channel::Sender<crate::sampler::MidiEvent>,
+    playback: &mut Option<PlaybackState>,
+) {
+    let already = playback.as_ref()
+        .map_or(false, |p| p.menu_idx == idx && !p.done.load(Ordering::Relaxed));
+    stop_playback(playback);
+    if !already {
+        let stop_flag   = Arc::new(AtomicBool::new(false));
+        let done_flag   = Arc::new(AtomicBool::new(false));
+        let paused_flag = Arc::new(AtomicBool::new(false));
+        let cur_us      = Arc::new(AtomicU64::new(0));
+        let seek_flag   = Arc::new(AtomicU64::new(u64::MAX));
+        let (handle, total_us) = crate::midi_player::spawn(
+            path, midi_tx.clone(),
+            Arc::clone(&stop_flag), Arc::clone(&done_flag),
+            Arc::clone(&paused_flag), Arc::clone(&cur_us),
+            Arc::clone(&seek_flag),
+        );
+        *playback = Some(PlaybackState {
+            stop: stop_flag, done: done_flag,
+            paused: paused_flag,
+            current_us: cur_us, total_us,
+            seek_to: seek_flag,
+            _handle: handle, menu_idx: idx,
+        });
+    }
+}
+
 // ── PlaybackInfo ──────────────────────────────────────────────────────────────
 
 /// Plain-value snapshot of playback position (no Arc/JoinHandle — safe to clone).

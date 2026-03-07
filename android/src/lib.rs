@@ -9,7 +9,7 @@
 // Package APK:
 //   cargo apk build --release -p pianeer-android
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -19,14 +19,14 @@ use std::time::Duration;
 static APP_CLASS_LOADER: OnceLock<jni::objects::GlobalRef> = OnceLock::new();
 
 use crossbeam_channel::bounded;
-use pianeer_core::dispatch::{apply_settings_action, rebuild_menu};
+use pianeer_core::dispatch::{apply_nav_action, apply_settings_action, rebuild_menu};
 use pianeer_core::loader::{LoadingJob, poll_loading_job, save_last_instrument_path, last_instrument_path};
 use pianeer_core::sampler::{MidiEvent, SamplerState};
 use pianeer_core::snapshot::build_snapshot;
-use pianeer_core::sys_stats::StatsCollector;
+use pianeer_core::sys_stats::{lan_server_url, StatsCollector};
 use pianeer_core::types::{
     MenuAction, MenuItem, PlaybackState, Settings,
-    stop_playback, playing_idx, pause_resume, seek_relative,
+    stop_playback, playing_idx, pause_resume, seek_relative, start_midi_playback,
 };
 use pianeer_core::{instruments, midi_player, midi_recorder};
 use pianeer_egui::{LocalBackend, PianeerApp, RemoteAudioPlayer};
@@ -434,42 +434,23 @@ fn android_main(android_app: android_activity::AndroidApp) {
                 // ── 2. Drain actions ──────────────────────────────────────────
                 let auto_tune = f32::from_bits(auto_tune_bits.load(Ordering::Relaxed));
                 while let Ok(action) = action_rx.try_recv() {
+                    if apply_nav_action(&action, &mut cursor, &mut menu) { continue; }
                     match action {
-                        MenuAction::CursorUp => {
-                            if cursor > 0 { cursor -= 1; }
-                        }
-                        MenuAction::CursorDown => {
-                            if cursor + 1 < menu.len() { cursor += 1; }
-                        }
-                        MenuAction::CycleVariant(dir) => {
-                            if let Some(MenuItem::Instrument(inst)) = menu.get_mut(cursor) {
-                                inst.cycle_variant(dir);
-                            }
-                        }
-                        MenuAction::CycleVariantAt { idx, dir } => {
-                            if let Some(MenuItem::Instrument(inst)) = menu.get_mut(idx) {
-                                inst.cycle_variant(dir);
-                            }
-                        }
                         MenuAction::PauseResume => { pause_resume(&playback); }
                         MenuAction::SeekRelative(secs) => { seek_relative(&playback, secs); }
                         MenuAction::ToggleRecord => {
-                            if midi_recorder::is_recording(&record_handle) {
-                                if let Some(buf) = midi_recorder::stop(&record_handle) {
-                                    let dir = std::path::Path::new(MIDI_DIR);
-                                    let _ = std::fs::create_dir_all(dir);
-                                    match midi_recorder::save(buf, dir) {
-                                        Ok(p)  => log::info!("recording saved: {}", p.display()),
-                                        Err(e) => log::error!("save failed: {e}"),
-                                    }
+                            let dir = std::path::Path::new(MIDI_DIR);
+                            match midi_recorder::stop_and_save(&record_handle, dir) {
+                                None => { midi_recorder::start(&record_handle); }
+                                Some(Ok(p)) => {
+                                    log::info!("recording saved: {}", p.display());
                                     (menu, current, cursor, current_path) = rebuild_menu(
                                         std::path::Path::new(SAMPLES_DIR),
                                         Some(std::path::Path::new(MIDI_DIR)),
                                         &menu, current, cursor,
                                     );
                                 }
-                            } else {
-                                midi_recorder::start(&record_handle);
+                                Some(Err(e)) => { log::error!("save failed: {e}"); }
                             }
                         }
                         MenuAction::Select => {
@@ -481,8 +462,8 @@ fn android_main(android_app: android_activity::AndroidApp) {
                                     {
                                         loading_job = Some((idx, LoadingJob::start(inst.clone())));
                                     }
-                                    MenuItem::MidiFile { .. } => {
-                                        android_select(idx, &mut menu, &midi_tx_bg, &mut playback);
+                                    MenuItem::MidiFile { path, .. } => {
+                                        start_midi_playback(idx, path.clone(), &midi_tx_bg, &mut playback);
                                     }
                                     _ => {}
                                 }
@@ -498,8 +479,8 @@ fn android_main(android_app: android_activity::AndroidApp) {
                                     {
                                         loading_job = Some((idx, LoadingJob::start(inst.clone())));
                                     }
-                                    MenuItem::MidiFile { .. } => {
-                                        android_select(idx, &mut menu, &midi_tx_bg, &mut playback);
+                                    MenuItem::MidiFile { path, .. } => {
+                                        start_midi_playback(idx, path.clone(), &midi_tx_bg, &mut playback);
                                     }
                                     _ => {}
                                 }
@@ -571,11 +552,7 @@ fn android_main(android_app: android_activity::AndroidApp) {
     let backend    = LocalBackend::new(snap_for_ui, action_tx);
     // Determine the LAN URL so the QR button shows a scannable code pointing at
     // this device's web server.  Falls back to localhost if no LAN route found.
-    let server_url = std::net::UdpSocket::bind("0.0.0.0:0")
-        .ok()
-        .and_then(|s| { s.connect("1.1.1.1:80").ok()?; s.local_addr().ok() })
-        .map(|a| format!("http://{}:4000", a.ip()))
-        .unwrap_or_else(|| "http://localhost:4000".to_string());
+    let server_url = lan_server_url(4000);
     let mut inner  = PianeerApp::new(Box::new(backend), server_url);
     inner.set_remote_audio(Box::new(AndroidRemoteAudio::new(remote_prod)));
     let app        = InsetApp { inner, android_app: android_app.clone(), top_px: None, connect_dialog_open: false };
@@ -881,55 +858,6 @@ fn spawn_midi_api_thread(
             log::info!("midi: session ended, will reconnect");
         }
     });
-}
-
-// ── Instrument / MIDI select helper ──────────────────────────────────────────
-
-fn android_select(
-    idx:     usize,
-    menu:    &mut Vec<MenuItem>,
-    midi_tx: &crossbeam_channel::Sender<MidiEvent>,
-    playback: &mut Option<PlaybackState>,
-) {
-    if idx >= menu.len() {
-        return;
-    }
-    match &menu[idx] {
-        MenuItem::MidiFile { path, .. } => {
-            let path           = path.clone();
-            let already_playing = playback
-                .as_ref()
-                .map_or(false, |p| p.menu_idx == idx && !p.done.load(Ordering::Relaxed));
-            stop_playback(playback);
-            if !already_playing {
-                let stop_flag   = Arc::new(AtomicBool::new(false));
-                let done_flag   = Arc::new(AtomicBool::new(false));
-                let paused_flag = Arc::new(AtomicBool::new(false));
-                let cur_us      = Arc::new(AtomicU64::new(0));
-                let seek_flag   = Arc::new(AtomicU64::new(u64::MAX));
-                let (handle, total_us) = midi_player::spawn(
-                    path,
-                    midi_tx.clone(),
-                    Arc::clone(&stop_flag),
-                    Arc::clone(&done_flag),
-                    Arc::clone(&paused_flag),
-                    Arc::clone(&cur_us),
-                    Arc::clone(&seek_flag),
-                );
-                *playback = Some(PlaybackState {
-                    stop:       stop_flag,
-                    done:       done_flag,
-                    paused:     paused_flag,
-                    current_us: cur_us,
-                    total_us,
-                    seek_to:    seek_flag,
-                    _handle:    handle,
-                    menu_idx:   idx,
-                });
-            }
-        }
-        _ => {} // same instrument re-selected, nothing to do
-    }
 }
 
 // ── Status-bar inset wrapper ──────────────────────────────────────────────────

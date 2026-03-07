@@ -40,6 +40,15 @@ pub fn elapsed(handle: &RecordHandle) -> Option<Duration> {
     handle.lock().ok()?.as_ref().map(|b| b.start.elapsed())
 }
 
+/// Stop recording and save to `dir`.
+/// Returns `None` if not recording (caller should call `start` instead),
+/// `Some(Ok(path))` on success, or `Some(Err(msg))` on save failure.
+pub fn stop_and_save(handle: &RecordHandle, dir: &Path) -> Option<Result<PathBuf, String>> {
+    let buf = stop(handle)?;
+    let _ = std::fs::create_dir_all(dir);
+    Some(save(buf, dir))
+}
+
 // ─── Save ─────────────────────────────────────────────────────────────────────
 
 /// Write an SMF Type-0 file to `dir` and return its path.

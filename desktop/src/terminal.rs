@@ -1,7 +1,7 @@
 // Raw-mode terminal loop.
 // Extracted from main.rs to keep the startup orchestrator slim.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -18,15 +18,15 @@ fn raw_off() {
     terminal::disable_raw_mode().ok();
 }
 
-use pianeer_core::dispatch::{apply_settings_action, rebuild_menu};
+use pianeer_core::dispatch::{apply_nav_action, apply_settings_action, rebuild_menu};
 use pianeer_core::loader::{load_instrument_data, save_last_instrument_path};
 use pianeer_core::sampler::{MidiEvent, SamplerState};
-use pianeer_core::{midi_player, midi_recorder};
+use pianeer_core::midi_recorder;
 use pianeer_core::snapshot::build_snapshot;
 use pianeer_core::sys_stats::StatsCollector;
 use pianeer_core::types::{
     MenuAction, MenuItem, PlaybackInfo, PlaybackState, ProcStats, Settings,
-    stop_playback, playing_idx, pause_resume, seek_relative,
+    stop_playback, playing_idx, pause_resume, seek_relative, start_midi_playback,
 };
 use crate::ui::{print_menu, print_qr_modal};
 
@@ -235,62 +235,27 @@ pub fn run_terminal(
         }
 
         if let Ok(action) = action_rx.try_recv() {
-            match action {
-                MenuAction::CursorUp => {
-                    if cursor > 0 { cursor -= 1; }
-                    let pb_info = mk_pb_info(&playback);
-                    let rec_elapsed = midi_recorder::elapsed(&record_handle);
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
-                        midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
-                }
-                MenuAction::CursorDown => {
-                    if cursor + 1 < menu.len() { cursor += 1; }
-                    let pb_info = mk_pb_info(&playback);
-                    let rec_elapsed = midi_recorder::elapsed(&record_handle);
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
-                        midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
-                }
-                MenuAction::CycleVariant(dir) => {
-                    if let Some(MenuItem::Instrument(inst)) = menu.get_mut(cursor) {
-                        inst.cycle_variant(dir);
-                    }
-                    let pb_info = mk_pb_info(&playback);
-                    let rec_elapsed = midi_recorder::elapsed(&record_handle);
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
-                        midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
-                }
-                MenuAction::CycleVariantAt { idx, dir } => {
-                    if let Some(MenuItem::Instrument(inst)) = menu.get_mut(idx) {
-                        inst.cycle_variant(dir);
-                    }
-                    let pb_info = mk_pb_info(&playback);
-                    let rec_elapsed = midi_recorder::elapsed(&record_handle);
-                    print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
-                        midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
-                }
+            if apply_nav_action(&action, &mut cursor, &mut menu) {
+                let pb_info = mk_pb_info(&playback);
+                let rec_elapsed = midi_recorder::elapsed(&record_handle);
+                print_menu(&menu, cursor, current, playing_idx(&playback), &settings, sustain_prev, &stats,
+                    midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
+            } else { match action {
                 MenuAction::ToggleRecord => {
-                    if midi_recorder::is_recording(&record_handle) {
-                        if let Some(buf) = midi_recorder::stop(&record_handle) {
-                            let save_dir = midi_dir.as_deref().unwrap_or_else(|| {
-                                std::path::Path::new("midi")
-                            });
-                            let _ = std::fs::create_dir_all(save_dir);
-                            match midi_recorder::save(buf, save_dir) {
-                                Ok(path) => {
-                                    raw_off();
-                                    println!("\r\nRecording saved: {}", path.display());
-                                    raw_on();
-                                }
-                                Err(e) => {
-                                    raw_off();
-                                    eprintln!("\r\nFailed to save recording: {}", e);
-                                    raw_on();
-                                }
-                            }
+                    let save_dir = midi_dir.as_deref().unwrap_or(std::path::Path::new("midi"));
+                    match midi_recorder::stop_and_save(&record_handle, save_dir) {
+                        None => { midi_recorder::start(&record_handle); }
+                        Some(Ok(path)) => {
+                            raw_off();
+                            println!("\r\nRecording saved: {}", path.display());
+                            raw_on();
                             reload.store(true, Ordering::SeqCst);
                         }
-                    } else {
-                        midi_recorder::start(&record_handle);
+                        Some(Err(e)) => {
+                            raw_off();
+                            eprintln!("\r\nFailed to save recording: {}", e);
+                            raw_on();
+                        }
                     }
                     let pb_info = mk_pb_info(&playback);
                     let rec_elapsed = midi_recorder::elapsed(&record_handle);
@@ -370,7 +335,7 @@ pub fn run_terminal(
                             midi_recorder::is_recording(&record_handle), rec_elapsed, pb_info.as_ref());
                     }
                 }
-            }
+            } } // close match action + else block
         }
     }
 }
@@ -412,30 +377,7 @@ fn term_do_select(
             raw_on();
         }
         MenuItem::MidiFile { path, .. } => {
-            let path = path.clone();
-            let already_playing = playback.as_ref()
-                .map_or(false, |p| p.menu_idx == idx && !p.done.load(Ordering::Relaxed));
-            stop_playback(playback);
-            if !already_playing {
-                let stop_flag   = Arc::new(AtomicBool::new(false));
-                let done_flag   = Arc::new(AtomicBool::new(false));
-                let paused_flag = Arc::new(AtomicBool::new(false));
-                let cur_us      = Arc::new(AtomicU64::new(0));
-                let seek_flag   = Arc::new(AtomicU64::new(u64::MAX));
-                let (handle, total_us) = midi_player::spawn(
-                    path, midi_tx.clone(),
-                    Arc::clone(&stop_flag), Arc::clone(&done_flag),
-                    Arc::clone(&paused_flag), Arc::clone(&cur_us),
-                    Arc::clone(&seek_flag),
-                );
-                *playback = Some(PlaybackState {
-                    stop: stop_flag, done: done_flag,
-                    paused: paused_flag,
-                    current_us: cur_us, total_us,
-                    seek_to: seek_flag,
-                    _handle: handle, menu_idx: idx,
-                });
-            }
+            start_midi_playback(idx, path.clone(), midi_tx, playback);
         }
         _ => {}
     }
