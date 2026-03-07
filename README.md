@@ -34,6 +34,22 @@ Pre-built binaries are attached to each [GitHub Release](https://github.com/fora
 - egui native window (optional — `--features native-ui`)
 - egui web interface (WASM, served from the same port)
 
+## Platform support
+
+| Feature | Linux | macOS | Windows | Android |
+|---------|:-----:|:-----:|:-------:|:-------:|
+| **Audio backend** | JACK / PipeWire | CoreAudio | WASAPI | Oboe / AAudio |
+| **MIDI input** | ALSA (midir) | CoreMIDI (midir) | WinMM (midir) | AMidi (NDK) |
+| **Terminal UI** | ✓ | ✓ | ✓ | — |
+| **Native egui window** | ✓ | ✓ | ✓ | — |
+| **DRM/KMS egui** (headless, no display server) | ✓ | — | — | — |
+| **Android egui** | — | — | — | ✓ |
+| **Web UI** (browser, port 4000) | ✓ | ✓ | ✓ | ✓ |
+| **MIDI file playback** | ✓ | ✓ | ✓ | ✓ |
+| **MIDI recording** | ✓ | ✓ | ✓ | ✓ |
+| **SFZ / ODF / GIG / Kontakt** | ✓ | ✓ | ✓ | ✓ |
+| **Audio streaming** (ring buffer → web) | ✓ | ✓ | ✓ | ✓ |
+
 ## Requirements
 
 ### Linux
@@ -55,7 +71,7 @@ Pre-built binaries are attached to each [GitHub Release](https://github.com/fora
 ### Android
 - Android 10+ (API 30+) — requires MANAGE_EXTERNAL_STORAGE permission
 - Place instruments under `/sdcard/Pianeer/samples/` and MIDI files under `/sdcard/Pianeer/midi/`
-- Built with cargo-apk; no Java/Kotlin required
+- Built with cargo-apk; requires `kotlinc` for the JNI bridge classes (`pacman -S kotlin` / `sdk install kotlin`)
 
 ## Building
 
