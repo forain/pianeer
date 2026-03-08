@@ -45,9 +45,12 @@ pub fn run_native_ui(
     });
 
     // Run eframe on the main thread (blocks until window closed).
-    let backend = LocalBackend::new(web_snapshot, action_tx);
+    let backend = LocalBackend::new(Arc::clone(&web_snapshot), action_tx.clone());
     let server_url = lan_server_url(4000);
-    let app = PianeerApp::new(Box::new(backend), server_url);
+    let peers = crate::discovery::start(4000);
+    let mut app = PianeerApp::new(Box::new(backend), server_url);
+    app.set_peers(peers);
+    app.set_local_source(web_snapshot, action_tx);
     eframe::run_native(
         "Pianeer",
         eframe::NativeOptions::default(),

@@ -6,19 +6,14 @@ use std::sync::atomic::AtomicBool;
 use axum::{
     Router,
     extract::{Host, ws::WebSocketUpgrade},
-    http::{header, StatusCode},
-    response::{Html, IntoResponse, Response},
+    http::header,
+    response::IntoResponse,
     routing::get,
 };
-use tower_http::services::ServeDir;
-
 use crate::audio_stream::AudioStreamHandle;
 use crate::types::MenuAction;
-use super::template::HTML_TEMPLATE;
-use super::ws::{handle_audio_pcm_ws, handle_audio_ws, handle_ws};
+use super::ws::{handle_audio_ws, handle_ws};
 
-/// WASM bundle embedded at compile time from web-wasm/dist/.
-/// Present when trunk has been run; empty dir otherwise (falls back to HTML_TEMPLATE).
 static WASM_DIST: include_dir::Dir<'static> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/../web-wasm/dist");
 
@@ -53,25 +48,17 @@ async fn serve_qr(Host(host): Host) -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/svg+xml")], svg)
 }
 
-/// Look for the trunk-built WASM bundle next to the cwd (dev) or the binary (installed).
-fn find_wasm_dist() -> Option<std::path::PathBuf> {
-    let candidates = [
-        std::env::current_dir().ok().map(|d| d.join("web-wasm").join("dist")),
-        std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("web-wasm").join("dist"))),
-    ];
-    candidates.into_iter().flatten().find(|d| d.join("index.html").exists())
-}
-
 fn mime_for(path: &str) -> &'static str {
-    if path.ends_with(".wasm")          { "application/wasm" }
-    else if path.ends_with(".js")       { "application/javascript" }
-    else if path.ends_with(".html")     { "text/html; charset=utf-8" }
-    else if path.ends_with(".css")      { "text/css" }
-    else if path.ends_with(".svg")      { "image/svg+xml" }
-    else                                { "application/octet-stream" }
+    if path.ends_with(".wasm")      { "application/wasm" }
+    else if path.ends_with(".js")   { "application/javascript" }
+    else if path.ends_with(".html") { "text/html; charset=utf-8" }
+    else if path.ends_with(".css")  { "text/css" }
+    else if path.ends_with(".svg")  { "image/svg+xml" }
+    else                            { "application/octet-stream" }
 }
 
-async fn serve_embedded(uri_path: &str) -> Response {
+async fn serve_embedded(uri_path: &str) -> impl IntoResponse {
+    use axum::http::StatusCode;
     let path = uri_path.trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
     match WASM_DIST.get_file(path) {
@@ -127,32 +114,11 @@ pub(super) async fn serve_http(
                 }
             }
         }))
-        .route("/audio-pcm-ws", get({
-            let audio = Arc::clone(&audio);
-            move |ws: WebSocketUpgrade| {
-                let audio = Arc::clone(&audio);
-                async move {
-                    ws.on_upgrade(move |socket| handle_audio_pcm_ws(socket, audio))
-                }
-            }
-        }));
+        ;
 
-    // Serve the egui WASM bundle if built, otherwise fall back to the embedded HTML.
-    if let Some(dist) = find_wasm_dist() {
-        eprintln!("Serving WASM UI from {}", dist.display());
-        app = app.fallback_service(ServeDir::new(dist));
-    } else if WASM_DIST.get_file("index.html").is_some() {
-        eprintln!("Serving embedded WASM UI");
-        app = app.fallback(|req: axum::extract::Request| async move {
-            serve_embedded(req.uri().path()).await
-        });
-    } else {
-        let html = Arc::new(HTML_TEMPLATE.replace("__CERT_HASH__", &cert_hash_json));
-        app = app.route("/", get(move || {
-            let html = Arc::clone(&html);
-            async move { Html(html.as_ref().clone()) }
-        }));
-    }
+    app = app.fallback(|req: axum::extract::Request| async move {
+        serve_embedded(req.uri().path()).await
+    });
 
     // Bind both IPv4 and IPv6 so `http://localhost:4000` works on macOS,
     // where browsers resolve `localhost` to ::1 (IPv6) first.

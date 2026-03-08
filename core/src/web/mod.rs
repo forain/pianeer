@@ -8,7 +8,6 @@ use crate::audio_stream::AudioStreamHandle;
 use crate::types::MenuAction;
 
 mod http;
-mod template;
 mod wt;
 mod ws;
 

@@ -9,7 +9,7 @@ use tokio::sync::broadcast;
 
 use crate::audio_stream::AudioStreamHandle;
 use crate::types::MenuAction;
-use super::ws::{b64, dispatch_cmd};
+use super::ws::dispatch_cmd;
 
 pub(super) async fn handle_session(
     incoming: wtransport::endpoint::IncomingSession,
@@ -23,16 +23,6 @@ pub(super) async fn handle_session(
 
     let (mut send, recv): (wtransport::SendStream, wtransport::RecvStream) =
         conn.open_bi().await?.await?;
-
-    // Send audio_init so the browser can configure its AudioDecoder.
-    // The browser will start feeding datagrams once it receives this.
-    let audio_init = format!(
-        "{{\"type\":\"audio_init\",\"streaminfo\":\"{}\"}}\n",
-        b64(&audio.stream_header[8..]) // bytes [8..42] = raw STREAMINFO payload
-    );
-    if send.write_all(audio_init.as_bytes()).await.is_err() {
-        return Ok(());
-    }
 
     // Datagram pusher: subscribe to the broadcast and forward as WT datagrams.
     // Datagrams are unreliable/unordered — late frames are simply dropped,
@@ -55,7 +45,6 @@ pub(super) async fn handle_session(
 
     // State pusher: send JSON snapshot every 100 ms.
     let snap_push = Arc::clone(&snapshot);
-    let audio_for_reinit = Arc::clone(&audio);
     let pusher = tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -65,7 +54,6 @@ pub(super) async fn handle_session(
                 break;
             }
         }
-        drop(audio_for_reinit); // keep Arc alive until pusher exits
     });
 
     // Reader: handle newline-delimited JSON commands.

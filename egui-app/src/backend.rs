@@ -72,7 +72,6 @@ fn client_cmd_to_action(cmd: ClientCmd) -> Option<MenuAction> {
         ClientCmd::PauseResume                 => Some(MenuAction::PauseResume),
         ClientCmd::SeekRelative { secs }       => Some(MenuAction::SeekRelative(secs)),
         ClientCmd::Rescan                      => Some(MenuAction::Rescan),
-        ClientCmd::RequestAudioInit            => None,
     }
 }
 
@@ -306,7 +305,6 @@ async fn wt_run(
         while let Some(nl) = line_buf.find('\n') {
             let line = line_buf[..nl].to_string();
             line_buf = line_buf[nl + 1..].to_string();
-            // Skip the audio_init line (handled at transport level).
             if let Ok(snap) = serde_json::from_str::<WebSnapshot>(&line) {
                 incoming.borrow_mut().push_back(snap);
             }

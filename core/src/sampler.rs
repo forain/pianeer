@@ -117,7 +117,7 @@ pub struct SamplerState {
     peak_hold_r: f32,
     /// Multiplicative decay applied per sample (20 dB/s fall time).
     peak_decay_per_frame: f32,
-    /// Lock-free ring buffer producer for the FLAC streaming encoder thread.
+    /// Lock-free ring buffer producer for the PCM streaming encoder thread.
     /// Written every process() call with stereo interleaved f32 output samples.
     pub audio_sink: Option<HeapProducer<f32>>,
 }
@@ -242,7 +242,7 @@ impl SamplerState {
             }
         }
 
-        // Tap post-volume audio for the FLAC streaming encoder (lock-free, non-blocking).
+        // Tap post-volume audio for the PCM streaming encoder (lock-free, non-blocking).
         if let Some(ref mut sink) = self.audio_sink {
             for i in 0..n_frames {
                 let _ = sink.push(out_l[i]);

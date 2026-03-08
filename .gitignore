@@ -1,6 +1,6 @@
 /target
 ./samples
 CLAUDE.md
-web-wasm/dist/
+web-wasm/dist/.stage/
 web-wasm/pianeer.log
 android/jniLibs/

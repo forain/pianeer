@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Pianeer</title>
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #1a1a1a; }
+    canvas { display: block; width: 100% !important; height: 100% !important; }
+    #loading { color: #aaa; font-family: monospace; padding: 20px; }
+  </style>
+<link rel="modulepreload" href="/pianeer-wasm-2e60c80a52b64a0e.js" crossorigin="anonymous" integrity="sha384-BVLTB56WyWY9vdkxD5XgagXDknShDtITP6a07Y9BHN933w65SWozPZXqFthvKb3u"><link rel="preload" href="/pianeer-wasm-2e60c80a52b64a0e_bg.wasm" crossorigin="anonymous" integrity="sha384-axZiLf4gksVFLlBR+1mZCQwv66CZel/2lZKspSedWIHkETd6NXCjcT6vZa1sOrHt" as="fetch" type="application/wasm"></head>
+<body>
+  <canvas id="pianeer_canvas"></canvas>
+  <noscript><p id="loading">JavaScript is required.</p></noscript>
+
+<script type="module">
+import init, * as bindings from '/pianeer-wasm-2e60c80a52b64a0e.js';
+const wasm = await init({ module_or_path: '/pianeer-wasm-2e60c80a52b64a0e_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script></body>
+</html>

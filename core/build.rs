@@ -1,5 +1,5 @@
 fn main() {
-    // Ensure web-wasm/dist/ exists so include_dir! doesn't fail before trunk is run.
+    // Ensure web-wasm/dist/ exists so include_dir! doesn't panic before trunk has been run.
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let dist = std::path::Path::new(&manifest).join("../web-wasm/dist");
     if !dist.exists() {

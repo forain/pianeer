@@ -355,7 +355,7 @@ fn android_main(android_app: android_activity::AndroidApp) {
         [0u8; 128], 0, 0, None,
     )));
 
-    // ── Ring buffer for audio streaming tap (JACK callback → FLAC encoder) ───
+    // ── Ring buffer for audio streaming tap (audio callback → PCM encoder) ───
     // 2 seconds of headroom at 48 kHz stereo.
     let (rb_prod, rb_cons) = ringbuf::HeapRb::<f32>::new(48000 * 2 * 2).split();
     state.lock().unwrap().audio_sink = Some(rb_prod);

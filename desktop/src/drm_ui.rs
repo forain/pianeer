@@ -486,8 +486,11 @@ pub fn run_drm_ui(
 
     // egui setup.
     let ctx     = egui::Context::default();
-    let backend = LocalBackend::new(web_snapshot, action_tx);
+    let backend = LocalBackend::new(Arc::clone(&web_snapshot), action_tx.clone());
+    let peers   = crate::discovery::start(4000);
     let mut app = PianeerApp::new(Box::new(backend), lan_server_url(4000));
+    app.set_peers(peers);
+    app.set_local_source(web_snapshot, action_tx);
     let mut input    = EvdevInput::new();
     let mut cursor   = egui::pos2(w as f32 / 2.0, h as f32 / 2.0);
     let mut textures: HashMap<egui::TextureId, EguiTexture> = HashMap::new();

@@ -2,6 +2,7 @@ mod midi;
 mod audio;
 mod ui;
 mod terminal;
+mod discovery;
 #[cfg(feature = "native-ui")]
 mod gui;
 #[cfg(all(feature = "kms", target_os = "linux"))]

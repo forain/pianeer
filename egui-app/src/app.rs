@@ -3,7 +3,7 @@ use std::time::Duration;
 use egui::{CentralPanel, Color32, FontId, RichText, ScrollArea, SidePanel, TopBottomPanel, Ui};
 use pianeer_core::snapshot::{ClientCmd, WebSnapshot};
 
-use crate::{PianeerBackend, RemoteBackend};
+use crate::{LocalBackend, PianeerBackend, RemoteBackend};
 
 #[cfg(target_arch = "wasm32")]
 use crate::wasm_audio::AudioPlayer;
@@ -23,6 +23,11 @@ pub struct PianeerApp {
     connect_input:  String,
     connect_error:  Option<String>,
     is_remote:      bool,
+    /// LAN-discovered peers (label, ws_url). Updated by the discovery background thread.
+    peers: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// Recreates the LocalBackend so the user can disconnect from a remote and return local.
+    /// None on WASM (always remote) or when started with a RemoteBackend.
+    local_restore: Option<Box<dyn Fn() -> Box<dyn PianeerBackend>>>,
     // WASM audio streaming
     #[cfg(target_arch = "wasm32")]
     audio_player:   Option<AudioPlayer>,
@@ -63,6 +68,8 @@ impl PianeerApp {
             connect_input,
             connect_error: None,
             is_remote,
+            peers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            local_restore: None,
             #[cfg(target_arch = "wasm32")]
             audio_player: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -77,6 +84,26 @@ impl PianeerApp {
     }
 
     pub fn is_remote(&self) -> bool { self.is_remote }
+
+    /// Inject a shared peer list populated by a platform discovery mechanism (e.g. mDNS).
+    pub fn set_peers(&mut self, peers: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+        self.peers = peers;
+    }
+
+    /// Store the local backend construction parameters so the user can return
+    /// to local after connecting to a remote instance.
+    pub fn set_local_source(
+        &mut self,
+        snapshot: std::sync::Arc<std::sync::Mutex<String>>,
+        action_tx: crossbeam_channel::Sender<pianeer_core::types::MenuAction>,
+    ) {
+        self.local_restore = Some(Box::new(move || {
+            Box::new(LocalBackend::new(
+                std::sync::Arc::clone(&snapshot),
+                action_tx.clone(),
+            ))
+        }));
+    }
 
     /// Current value of the remote-connect text field (for pre-filling dialogs).
     pub fn get_connect_input(&self) -> &str {
@@ -131,19 +158,29 @@ impl PianeerApp {
         #[cfg(target_arch = "wasm32")]
         render_audio_bar(ctx, &self.server_url, &mut self.audio_player);
 
-        if portrait {
+        let can_go_local = self.local_restore.is_some();
+        let want_local = if portrait {
             render_settings_bottom(
                 ctx, &snap, &mut self.backend,
                 &mut self.settings_open, &mut self.show_qr,
                 &mut self.connect_input, &mut self.is_remote,
                 &mut self.connect_error, &mut self.server_url,
-            );
+                &self.peers, can_go_local,
+            )
         } else {
             render_settings_panel(
                 ctx, &snap, &mut self.backend, &mut self.show_qr,
                 &mut self.connect_input, &mut self.is_remote,
                 &mut self.connect_error, &mut self.server_url,
-            );
+                &self.peers, can_go_local,
+            )
+        };
+        if want_local {
+            if let Some(ref restore) = self.local_restore {
+                self.backend = restore();
+                self.is_remote = false;
+                self.connect_error = None;
+            }
         }
 
         render_main(ctx, &snap, &mut *self.backend);
@@ -336,7 +373,10 @@ fn render_settings_panel(
     is_remote: &mut bool,
     connect_error: &mut Option<String>,
     server_url: &mut String,
-) {
+    peers: &std::sync::Mutex<Vec<(String, String)>>,
+    can_go_local: bool,
+) -> bool {
+    let mut want_local = false;
     SidePanel::right("settings").min_width(180.0).show(ctx, |ui| {
         ui.heading("Settings");
         ui.separator();
@@ -354,8 +394,10 @@ fn render_settings_panel(
         if ui.button("QR Code").clicked() { *show_qr = !*show_qr; }
 
         ui.separator();
-        connect_section(ui, backend, connect_input, is_remote, connect_error, server_url);
+        want_local = connect_section(ui, backend, connect_input, is_remote,
+                                     connect_error, server_url, peers, can_go_local);
     });
+    want_local
 }
 
 // ── Settings bottom panel (portrait / mobile) ─────────────────────────────────
@@ -370,7 +412,10 @@ fn render_settings_bottom(
     is_remote: &mut bool,
     connect_error: &mut Option<String>,
     server_url: &mut String,
-) {
+    peers: &std::sync::Mutex<Vec<(String, String)>>,
+    can_go_local: bool,
+) -> bool {
+    let mut want_local = false;
     TopBottomPanel::bottom("settings_bottom").show(ctx, |ui| {
         // Toggle header row.
         ui.horizontal(|ui| {
@@ -444,9 +489,13 @@ fn render_settings_bottom(
 
             // Row 3: remote connect.
             ui.separator();
-            connect_section_compact(ui, backend, connect_input, is_remote, connect_error, server_url);
+            if connect_section_compact(ui, backend, connect_input, is_remote,
+                                       connect_error, server_url, peers, can_go_local) {
+                want_local = true;
+            }
         }
     });
+    want_local
 }
 
 // ── Shared settings widgets ───────────────────────────────────────────────────
@@ -504,6 +553,7 @@ fn record_rescan(ui: &mut Ui, recording: bool, backend: &mut dyn PianeerBackend)
 // ── Remote connect UI ─────────────────────────────────────────────────────────
 
 /// Full connect section for the landscape side panel.
+/// Returns true if the user requested disconnecting back to local.
 fn connect_section(
     ui: &mut Ui,
     backend: &mut Box<dyn PianeerBackend>,
@@ -511,12 +561,46 @@ fn connect_section(
     is_remote: &mut bool,
     error: &mut Option<String>,
     server_url: &mut String,
-) {
-    ui.label(
-        RichText::new(if *is_remote { "Remote ✓" } else { "Remote" })
-            .color(if *is_remote { Color32::from_rgb(80, 192, 80) } else { Color32::from_gray(180) })
-            .small(),
-    );
+    peers: &std::sync::Mutex<Vec<(String, String)>>,
+    can_go_local: bool,
+) -> bool {
+    let mut want_local = false;
+
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(if *is_remote { "Remote ✓" } else { "Remote" })
+                .color(if *is_remote { Color32::from_rgb(80, 192, 80) } else { Color32::from_gray(180) })
+                .small(),
+        );
+        if *is_remote && can_go_local {
+            if ui.small_button("← Local").clicked() {
+                want_local = true;
+            }
+        }
+    });
+
+    // Discovered peers (mDNS).
+    let discovered: Vec<(String, String)> = peers.lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    if !discovered.is_empty() {
+        ui.label(RichText::new("Discovered").color(Color32::from_gray(130)).small());
+        for (label, ws_url) in &discovered {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).color(Color32::from_gray(220)));
+                if ui.small_button("Connect").clicked() {
+                    *input = ws_url
+                        .trim_start_matches("ws://")
+                        .trim_end_matches("/ws")
+                        .to_string();
+                    do_connect(backend, input, is_remote, error, server_url);
+                }
+            });
+        }
+        ui.separator();
+    }
+
+    // Manual entry.
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(input)
             .hint_text("host:4000")
@@ -528,9 +612,11 @@ fn connect_section(
     if let Some(ref e) = *error {
         ui.label(RichText::new(e.as_str()).color(Color32::RED).small());
     }
+    want_local
 }
 
 /// Compact connect row for the portrait bottom drawer.
+/// Returns true if the user requested disconnecting back to local.
 fn connect_section_compact(
     ui: &mut Ui,
     backend: &mut Box<dyn PianeerBackend>,
@@ -538,7 +624,29 @@ fn connect_section_compact(
     is_remote: &mut bool,
     error: &mut Option<String>,
     server_url: &mut String,
-) {
+    peers: &std::sync::Mutex<Vec<(String, String)>>,
+    can_go_local: bool,
+) -> bool {
+    let mut want_local = false;
+    // Discovered peers (one button each).
+    let discovered: Vec<(String, String)> = peers.lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    if !discovered.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("🔍").color(Color32::from_gray(130)));
+            for (label, ws_url) in &discovered {
+                if ui.button(RichText::new(label).small()).clicked() {
+                    *input = ws_url
+                        .trim_start_matches("ws://")
+                        .trim_end_matches("/ws")
+                        .to_string();
+                    do_connect(backend, input, is_remote, error, server_url);
+                }
+            }
+        });
+    }
+
     ui.horizontal_wrapped(|ui| {
         let label = if *is_remote { "🌐 ✓" } else { "🌐" };
         ui.label(RichText::new(label).color(if *is_remote {
@@ -546,6 +654,11 @@ fn connect_section_compact(
         } else {
             Color32::from_gray(160)
         }));
+        if *is_remote && can_go_local {
+            if ui.small_button("← Local").clicked() {
+                want_local = true;
+            }
+        }
         ui.add(egui::TextEdit::singleline(input)
             .hint_text("host:4000")
             .desired_width(110.0));
@@ -556,6 +669,26 @@ fn connect_section_compact(
             ui.label(RichText::new(e.as_str()).color(Color32::RED).small());
         }
     });
+    want_local
+}
+
+/// True if `host_port` refers to this machine (loopback or LAN self-address).
+fn is_local_address(host_port: &str) -> bool {
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
+        return true;
+    }
+    // Check against the outbound LAN IP (the same trick used for QR code generation).
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if sock.connect("1.1.1.1:80").is_ok() {
+            if let Ok(addr) = sock.local_addr() {
+                if addr.ip().to_string() == host {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Replace the backend with a new RemoteBackend pointing at `input`.
@@ -576,6 +709,15 @@ fn do_connect(
     } else {
         format!("{}:4000", host)
     };
+
+    // Refuse self-connection: connecting to localhost or our own LAN IP would
+    // silently replace the efficient LocalBackend with a WebSocket round-trip
+    // to ourselves with no way back.
+    if !*is_remote && is_local_address(&host_port) {
+        *error = Some("Already running locally — no need to connect.".to_string());
+        return;
+    }
+
     let ws_url = format!("ws://{}/ws", host_port);
     match RemoteBackend::connect(&ws_url) {
         Ok(new_backend) => {

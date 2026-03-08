@@ -21,7 +21,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Cache trunk binary
+        id: cache-trunk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/trunk
+          key: trunk-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
       - name: Install trunk
+        if: steps.cache-trunk.outputs.cache-hit != 'true'
         run: cargo install trunk --locked
 
       - name: Build
@@ -33,8 +41,8 @@ jobs:
           path: web-wasm/dist/
 
   # ── macOS ────────────────────────────────────────────────────────────────────
-  build-macos:
-    name: macOS universal (Intel + Apple Silicon)
+  build-macos-x86:
+    name: macOS Intel (x86_64)
     runs-on: macos-latest
     needs: [build-wasm]
     steps:
@@ -42,33 +50,86 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-apple-darwin   # aarch64-apple-darwin is the runner's native target
+          targets: x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-apple-darwin
 
       - uses: actions/download-artifact@v4
         with:
           name: wasm-dist
           path: web-wasm/dist/
 
-      - name: Build (Intel x86_64)
+      - name: Build
         run: cargo build --release -p pianeer --target x86_64-apple-darwin
 
-      - name: Build (Apple Silicon arm64)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pianeer-macos-x86_64
+          path: target/x86_64-apple-darwin/release/pianeer
+
+  build-macos-arm:
+    name: macOS Apple Silicon (arm64)
+    runs-on: macos-latest
+    needs: [build-wasm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-darwin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm-dist
+          path: web-wasm/dist/
+
+      - name: Build
         run: cargo build --release -p pianeer --target aarch64-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pianeer-macos-aarch64
+          path: target/aarch64-apple-darwin/release/pianeer
+
+  build-macos-universal:
+    name: macOS universal binary (lipo)
+    runs-on: macos-latest
+    needs: [build-macos-x86, build-macos-arm]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pianeer-macos-x86_64
+          path: macos-x86_64/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: pianeer-macos-aarch64
+          path: macos-aarch64/
 
       - name: Merge into universal binary
         run: |
           lipo -create \
             -output pianeer-macos-universal \
-            target/x86_64-apple-darwin/release/pianeer \
-            target/aarch64-apple-darwin/release/pianeer
+            macos-x86_64/pianeer \
+            macos-aarch64/pianeer
           lipo -info pianeer-macos-universal
+
+      - name: Rename arch binaries for release
+        run: |
+          cp macos-x86_64/pianeer pianeer-macos-x86_64
+          cp macos-aarch64/pianeer pianeer-macos-arm64
 
       - uses: actions/upload-artifact@v4
         with:
           name: pianeer-macos-universal
-          path: pianeer-macos-universal
+          path: |
+            pianeer-macos-universal
+            pianeer-macos-x86_64
+            pianeer-macos-arm64
 
   # ── Linux ─────────────────────────────────────────────────────────────────
   build-linux:
@@ -172,7 +233,15 @@ jobs:
             "build-tools;35.0.1" \
           || true   # already installed on the runner → ignore exit code
 
+      - name: Cache cargo-apk binary
+        id: cache-cargo-apk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-apk
+          key: cargo-apk-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
       - name: Install cargo-apk
+        if: steps.cache-cargo-apk.outputs.cache-hit != 'true'
         run: cargo install cargo-apk --locked
 
       - name: Write release keystore
@@ -201,7 +270,7 @@ jobs:
   # Only runs on version tags; downloads all artifacts and attaches them.
   release:
     name: Publish GitHub release
-    needs: [build-macos, build-linux, build-windows, build-android]
+    needs: [build-macos-universal, build-linux, build-windows, build-android]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:

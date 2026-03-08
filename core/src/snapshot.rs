@@ -62,7 +62,6 @@ pub enum ClientCmd {
     PauseResume,
     SeekRelative { secs: i64 },
     Rescan,
-    RequestAudioInit,
 }
 
 // ── Snapshot builder ──────────────────────────────────────────────────────────
