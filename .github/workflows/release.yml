@@ -177,15 +177,28 @@ jobs:
 
   # ── Windows ──────────────────────────────────────────────────────────────────
   build-windows:
-    name: Windows x86_64
+    name: Windows ${{ matrix.artifact }}
     runs-on: windows-latest
     needs: [build-wasm]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            artifact: pianeer-windows-amd64.exe
+          - target: aarch64-pc-windows-msvc
+            artifact: pianeer-windows-arm64.exe
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -193,12 +206,12 @@ jobs:
           path: web-wasm/dist/
 
       - name: Build
-        run: cargo build --release -p pianeer --target x86_64-pc-windows-msvc
+        run: cargo build --release -p pianeer --target ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pianeer-windows-amd64
-          path: target/x86_64-pc-windows-msvc/release/pianeer.exe
+          name: ${{ matrix.artifact }}
+          path: target/${{ matrix.target }}/release/pianeer.exe
 
   # ── Android ─────────────────────────────────────────────────────────────────
   build-android:
