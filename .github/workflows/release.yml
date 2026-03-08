@@ -210,7 +210,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: aarch64-linux-android,x86_64-linux-android
 
       - uses: Swatinem/rust-cache@v2
 
@@ -252,19 +252,34 @@ jobs:
           sed -i 's|path\s*=\s*"[^"]*pianeer-release\.jks"|path = "/tmp/pianeer-release.jks"|' \
             android/Cargo.toml
 
-      - name: Build APK
+      - name: Build APK (arm64)
         env:
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
-          # Must be an env var; cargo-apk strips RUSTFLAGS from .cargo/config.toml
           RUSTFLAGS: >-
             -C link-arg=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_static.a
             -C link-arg=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++abi.a
-        run: cargo apk build --release -p pianeer-android
+        run: cargo apk build --release -p pianeer-android --target aarch64-linux-android
+
+      - name: Rename arm64 APK
+        run: cp target/release/apk/pianeer-android.apk pianeer-android-arm64.apk
+
+      - name: Build APK (x86_64)
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          RUSTFLAGS: >-
+            -C link-arg=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/libc++_static.a
+            -C link-arg=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/libc++abi.a
+        run: cargo apk build --release -p pianeer-android --target x86_64-linux-android
+
+      - name: Rename x86_64 APK
+        run: cp target/release/apk/pianeer-android.apk pianeer-android-x86_64.apk
 
       - uses: actions/upload-artifact@v4
         with:
           name: pianeer-android
-          path: target/release/apk/pianeer-android.apk
+          path: |
+            pianeer-android-arm64.apk
+            pianeer-android-x86_64.apk
 
   # ── GitHub Release ───────────────────────────────────────────────────────────
   # Only runs on version tags; downloads all artifacts and attaches them.
