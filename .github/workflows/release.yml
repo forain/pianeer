@@ -202,17 +202,30 @@ jobs:
 
   # ── Android ─────────────────────────────────────────────────────────────────
   build-android:
-    name: Android arm64 APK
+    name: Android ${{ matrix.artifact }}
     runs-on: ubuntu-latest
     needs: [build-wasm]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            artifact: pianeer-android-arm64.apk
+            ndk_lib: aarch64-linux-android
+          - target: x86_64-linux-android
+            artifact: pianeer-android-x86_64.apk
+            ndk_lib: x86_64-linux-android
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,x86_64-linux-android
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -252,40 +265,25 @@ jobs:
           sed -i 's|path\s*=\s*"[^"]*pianeer-release\.jks"|path = "/tmp/pianeer-release.jks"|' \
             android/Cargo.toml
 
-      - name: Build APK (arm64)
+      - name: Build APK
         env:
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           RUSTFLAGS: >-
-            -C link-arg=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_static.a
-            -C link-arg=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++abi.a
-        run: cargo apk build --release -p pianeer-android --target aarch64-linux-android
-
-      - name: Rename arm64 APK
-        run: cp target/release/apk/pianeer-android.apk pianeer-android-arm64.apk
-
-      - name: Build APK (x86_64)
-        env:
-          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
-          RUSTFLAGS: >-
-            -C link-arg=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/libc++_static.a
-            -C link-arg=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/libc++abi.a
-        run: cargo apk build --release -p pianeer-android --target x86_64-linux-android
-
-      - name: Rename x86_64 APK
-        run: cp target/release/apk/pianeer-android.apk pianeer-android-x86_64.apk
+            -C link-arg=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ matrix.ndk_lib }}/libc++_static.a
+            -C link-arg=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ matrix.ndk_lib }}/libc++abi.a
+        run: cargo apk build --release -p pianeer-android --target ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pianeer-android
-          path: |
-            pianeer-android-arm64.apk
-            pianeer-android-x86_64.apk
+          name: ${{ matrix.artifact }}
+          path: target/release/apk/pianeer-android.apk
 
   # ── GitHub Release ───────────────────────────────────────────────────────────
   # Only runs on version tags; downloads all artifacts and attaches them.
   release:
     name: Publish GitHub release
     needs: [build-macos-universal, build-linux, build-windows, build-android]
+    # build-android is a matrix job; all matrix variants must complete first
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
