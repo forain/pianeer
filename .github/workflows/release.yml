@@ -284,6 +284,8 @@ jobs:
           RUSTFLAGS: >-
             -C link-arg=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ matrix.ndk_lib }}/libc++_static.a
             -C link-arg=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ matrix.ndk_lib }}/libc++abi.a
+          # apksigner can't read PKCS12 keystores created by JDK 17+ without this flag
+          JAVA_TOOL_OPTIONS: "-Dkeystore.pkcs12.legacy"
         run: cargo apk build --release -p pianeer-android --target ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
