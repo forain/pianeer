@@ -83,8 +83,31 @@ RUSTFLAGS="-C link-arg=$(ndk_lib x86_64-linux-android)/libc++_static.a -C link-a
 "$CARGO_BIN/cargo-apk" apk build --release -p pianeer-android --target x86_64-linux-android
 cp target/release/apk/pianeer-android.apk "$OUT/pianeer-android-x86_64.apk"
 
+# ── macOS (cross-compile via cargo-zigbuild) ──────────────────────────────────
+# Requires:
+#   1. zig + cargo-zigbuild installed (see Windows steps above)
+#   2. Rust macOS targets: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+#   3. Optionally set SDKROOT to a real macOS SDK if Zig's bundled headers are insufficient:
+#        On your Mac: tar -czf MacOSX.sdk.tar.gz -C "$(dirname $(xcrun --show-sdk-path))" "$(basename $(xcrun --show-sdk-path))"
+#        Transfer to Linux and set: export SDKROOT=/path/to/MacOSX.sdk
+if command -v zig &>/dev/null && command -v cargo-zigbuild &>/dev/null; then
+    step "macOS x86_64"
+    cargo zigbuild --release -p pianeer --target x86_64-apple-darwin
+    cp target/x86_64-apple-darwin/release/pianeer "$OUT/pianeer-macos-x86_64"
+
+    step "macOS arm64"
+    cargo zigbuild --release -p pianeer --target aarch64-apple-darwin
+    cp target/aarch64-apple-darwin/release/pianeer "$OUT/pianeer-macos-arm64"
+
+    step "macOS universal"
+    lipo -create \
+        -output "$OUT/pianeer-macos-universal" \
+        "$OUT/pianeer-macos-x86_64" \
+        "$OUT/pianeer-macos-arm64"
+else
+    echo "SKIP: macOS targets (zig/cargo-zigbuild not found)"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 step "Done — artifacts in $OUT:"
 ls -lh "$OUT"
-echo
-echo "NOTE: macOS binaries (x86_64, arm64, universal) require building on macOS or via CI."
